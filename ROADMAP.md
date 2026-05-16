@@ -21,7 +21,7 @@
   - udon chỉ lấy 1 lần / spot / ngày / xe (dù ghé nhiều lần)
   - inventory refill về max đầu mỗi ngày mới
   - tồn kho riêng từng đội (đối thủ lấy không ảnh hưởng)
-- ⬜ Random map generator (`src/env/map_generator.py`):
+- ✅ Random map generator (`src/env/map_generator.py`):
   - sinh map ngẫu nhiên trong range 8×8 → 32×32
   - vary: tỉ lệ terrain, số spot, số series, phân bố spot
   - seed-based để reproduce
@@ -42,7 +42,7 @@
   - Input: map layout, vị trí start, series distribution
   - Output: n_patrol vs n_supply tối ưu + vị trí nào làm patrol/supply
   - Approach: score vị trí (patrol = gần nhiều series; supply = trung tâm các xe), simulate top-K combo với LookaheadPlanner → chọn tốt nhất theo avg unique_series
-- ⬜ Benchmark runner (`src/benchmark.py`):
+- ✅ Benchmark runner (`src/benchmark.py`):
   - chạy N game với random maps, thống kê avg unique_series / avg udon / win rate
   - dùng để so sánh Greedy vs Lookahead vs RL sau này
 - ⬜ Parameter tuning cho Lookahead (random search, ~500 games):
@@ -73,25 +73,25 @@
   - patrol: tổng fuel cost ≤ `agent.fuel`
   - output: `(is_valid: bool, errors: List[str])`
   - **Dùng cho chiến thuật**: submit greedy ngay (~100ms), override bằng lookahead nếu validator pass và còn thời gian
-- ⬜ `src/env/scoring.py` — extract pure function từ simulator:
+- ✅ `src/env/scoring.py` — extract pure function từ simulator:
   - `compute_score(state) -> Score` với 3 tiêu chí: unique_series → daily_series_sum → total_udon
   - Dùng để optimizer so sánh 2 plan mà không cần reset simulator
 
 ### Visualizer & Replay
-- ⬜ `visualizer/` — terminal ASCII, không cần GUI:
-  - Grid: `P`=patrol, `S`=supply, `*`=spot còn hàng, `.`=spot hết, `#`=lake, `=`=road, `^`=mountain
-  - Overlay traffic: `[B]`=busy, `[C]`=congested
-  - Thanh fuel từng xe patrol
+- ✅ `visualizer/terminal.py` — terminal ASCII, không cần GUI:
+  - Grid: `P1`=patrol, `S1`=supply, `**`=spot còn hàng, `..`=spot hết, `##`=lake, `==`/`=B`/`=C`=road, `^^`=mountain
+  - Thanh fuel `[████░░]` từng xe patrol
   - Series đã collect / còn lại
-- ⬜ `replay/` — ghi JSON mỗi ngày (day, state, orders, reward, agent_positions, collected_series, traffic_snapshot):
-  - Load file → chạy lại từng ngày → thấy bot sai ở đâu
-  - Dùng cả trong training để debug RL
+- ✅ `replay/` — ghi JSON mỗi ngày (day, state, orders, agent_positions, collected_series, traffic):
+  - `ReplayRecorder.record(state, orders)` → `save(path)`
+  - `ReplayPlayer.load(path)` → iterate frames, `agent_trace(id)`, `summary()`
+  - Dùng để debug bot sau trận và trong training RL
 
 ### Traffic Predictor
-- ⬜ `src/env/traffic_predictor.py` — dự đoán traffic ngày mai:
+- ✅ `src/env/traffic_predictor.py` — dự đoán traffic ngày mai:
   - Heuristic: giả định đối thủ dùng greedy đến spot gần nhất → A* path → đếm bước ở road cell
+  - `predict_and_scale()`: scale theo số đội ẩn (chỉ thấy 1 phần vị trí đối thủ)
   - Cộng vào `TrafficModel` → biết ngày mai đường nào kẹt để lookahead tránh chủ động
-  - RL sẽ tự học sau, nhưng heuristic này dùng được ngay từ tháng 1
 
 ### Input/Output & Client
 - ✅ `spec_input_output.md` — dự đoán JSON format
