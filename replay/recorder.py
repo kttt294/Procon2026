@@ -16,6 +16,9 @@ from __future__ import annotations
 
 import json
 import os
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+
 from typing import Any, Dict, List
 
 from env.models import DayOrder, DayState
