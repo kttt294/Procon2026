@@ -49,3 +49,8 @@ RW_DAILY_SERIES =  10.0
 RW_UDON         =   1.0
 RW_FUEL_EMPTY   = -10.0
 RW_WASTED_STEP  =  -0.05
+
+# Potential-based reward shaping: phi(s) = -POTENTIAL_SCALE * mean_min_hex_dist_to_uncollected_spot
+# Shaped reward = r + gamma * phi(s') - phi(s)
+# Scale 10 → getting 1 hex closer ≈ 10 shaped reward units (comparable to RW_UDON)
+POTENTIAL_SCALE = 10.0

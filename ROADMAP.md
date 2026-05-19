@@ -10,6 +10,7 @@
 > Nếu simulator còn bug → mọi thứ ở tháng 2-3 đều vô nghĩa.
 
 ### Simulator
+
 - ✅ `src/env/hex_grid.py` — hex grid, adjacency, hex_distance
 - ✅ `src/env/models.py` — MatchConfig, MapData, DayState, DayOrder, AgentState
 - ✅ `src/env/simulator.py` — apply_day(), traffic model, fuel model, scoring
@@ -27,9 +28,11 @@
   - seed-based để reproduce
 
 ### Pathfinding
-- ✅ `src/pathfinding/astar.py` — Weighted A*, multi_waypoint_path
+
+- ✅ `src/pathfinding/astar.py` — Weighted A\*, multi_waypoint_path
 
 ### Heuristic
+
 - ✅ `src/strategy/greedy.py` — greedy baseline
 - ✅ `src/strategy/lookahead.py` — look-ahead heuristic:
   - ✅ global series assignment (không 2 xe waste vào cùng uncollected series)
@@ -49,6 +52,7 @@
   - `new_series_bonus`, `secondary_max`, `low_fuel_threshold`, `reposition_weight`
 
 ### Tests
+
 - ✅ `tests/test_hex_grid.py`:
   - neighbor đúng 6 hướng, edge cell không out-of-bound
   - `hex_distance` vs expected cube coordinate values
@@ -66,6 +70,7 @@
 - ✅ `tests/test_validator.py` — action hợp lệ / không hợp lệ
 
 ### Validator & Scoring
+
 - ✅ `src/env/validator.py` — kiểm tra `List[DayOrder]` trước khi POST:
   - cell đích kề ô hiện tại (direction hợp lệ)
   - không đi vào lake
@@ -78,6 +83,7 @@
   - Dùng để optimizer so sánh 2 plan mà không cần reset simulator
 
 ### Visualizer & Replay
+
 - ✅ `visualizer/terminal.py` — terminal ASCII, không cần GUI:
   - Grid: `P1`=patrol, `S1`=supply, `**`=spot còn hàng, `..`=spot hết, `##`=lake, `==`/`=B`/`=C`=road, `^^`=mountain
   - Thanh fuel `[████░░]` từng xe patrol
@@ -88,16 +94,19 @@
   - Dùng để debug bot sau trận và trong training RL
 
 ### Traffic Predictor
+
 - ✅ `src/env/traffic_predictor.py` — dự đoán traffic ngày mai:
-  - Heuristic: giả định đối thủ dùng greedy đến spot gần nhất → A* path → đếm bước ở road cell
+  - Heuristic: giả định đối thủ dùng greedy đến spot gần nhất → A\* path → đếm bước ở road cell
   - `predict_and_scale()`: scale theo số đội ẩn (chỉ thấy 1 phần vị trí đối thủ)
   - Cộng vào `TrafficModel` → biết ngày mai đường nào kẹt để lookahead tránh chủ động
 
 ### Input/Output & Client
+
 - ✅ `spec_input_output.md` — dự đoán JSON format
 - ✅ `src/client/http_client.py` — GET state, POST action, retry
 
 ### Checkpoint cuối tháng 1
+
 ```
 ✓ Simulator pass toàn bộ unit test
 ✓ Lookahead > Greedy trên benchmark 100 random games
@@ -112,13 +121,14 @@
 > Nếu không đạt → debug reward/architecture trước khi tiếp tục.
 
 ### RL Infrastructure
+
 - ✅ `src/rl/actor_critic.py` — CNN encoder + per-agent MLP + actor/critic
 - ✅ `src/rl/mappo.py` — MAPPO, rollout buffer, GAE-Lambda
-- ⬜ Reward shaping cải thiện:
-  - potential-based: `phi(s) = -min_distance_to_nearest_uncollected_series_spot`
+- ✅ Reward shaping cải thiện:
+  - potential-based: `phi(s) = -POTENTIAL_SCALE * mean_min_hex_dist_to_uncollected_spot`
   - `r_shaped = r + gamma * phi(s') - phi(s)`
-- ⬜ Logging: TensorBoard hoặc wandb — loss, reward, unique_series per episode
-- ⬜ Curriculum learning engine (`src/rl/curriculum.py`):
+- ✅ Logging: TensorBoard — loss, reward, unique_series, total_udon per episode
+- ✅ Curriculum learning engine (`src/rl/curriculum.py`):
   ```
   Level 1: map 8×8,  4 ngày,  3 agents, 3 series   ← bắt đầu đây
   Level 2: map 12×12, 5 ngày, 4 agents, 4 series
@@ -129,18 +139,19 @@
   ```
 
 ### Self-play + Opponent Modeling
-- ⬜ Self-play pool (`src/rl/selfplay.py`):
+
+- ✅ Self-play pool (`src/rl/selfplay.py`):
   - duy trì pool 5 checkpoint cũ làm "đối thủ"
   - mỗi episode: sample ngẫu nhiên 1 checkpoint từ pool
   - cập nhật pool mỗi 1000 episodes
-- ⬜ Opponent features trong state:
-  - vị trí xe đối thủ → RL tự học suy ra traffic ngày mai
-  - (đã có `opponent_cells` trong DayState, chỉ cần encode vào map feature)
-- ⬜ Simple opponent traffic estimator (heuristic, dùng song song):
-  - giả sử đối thủ dùng greedy → estimate step counts của họ
-  - cộng vào traffic model → dự đoán traffic ngày mai sớm hơn
+- ✅ Opponent features trong state:
+  - vị trí xe đối thủ encode vào channel 9 của map feature tensor
+  - RL tự học suy ra traffic ngày mai từ vị trí đối thủ
+- ✅ Opponent traffic từ self-play:
+  - opponent model chạy A\* → đếm road steps → cộng vào traffic model qua `opponent_step_counts`
 
 ### Population-based Training (PBT) — nếu có đủ compute
+
 - ⬜ Train song song N agent (N=4–8) với hyperparams khác nhau
   - mỗi agent có learning rate, entropy coef, reward weights riêng
 - ⬜ Exploit/explore mỗi K episodes:
@@ -150,6 +161,7 @@
 - Có thể bỏ qua nếu không có multi-GPU; single-GPU thì làm tuần tự
 
 ### Checkpoint cuối tháng 2
+
 ```
 ✓ RL beat Greedy trên map 8×8 (Level 1)
 ✓ RL đang train được lên Level 3 (16×16)
@@ -164,26 +176,29 @@
 > Mục tiêu: hệ thống hoàn chỉnh, tested, reliable ngày thi.
 
 ### MCTS trên value function học được (AlphaZero-style)
+
 > Episode chỉ 4-10 ngày → cây MCTS nông → khả thi trong time_limit.
 
-- ⬜ `src/strategy/mcts.py`:
+- ✅ `src/strategy/mcts.py`:
   - Node = DayState sau khi apply assignment action
-  - Expand = top-K assignments theo Lookahead score (beam, không brute-force)
-  - Evaluate = critic network từ MAPPO (thay random rollout)
+  - Expand = top-K joint actions sampled từ actor logits (beam diversity)
+  - Evaluate = critic network từ MAPPO (không cần random rollout)
   - Select = UCB1: `score = Q + c * sqrt(ln(N_parent) / N_node)`
-  - Time budget: chạy đến `time_limit_ms - 500ms` rồi dừng, trả best action
+  - Time budget: chạy đến `time_limit_ms - 800ms` rồi dừng, trả best action
 - ⬜ Benchmark: MCTS vs pure RL vs Lookahead trên 100 games map 24×24 và 32×32
 - ⬜ Inference time profiling: đảm bảo MCTS < 3000ms cho worst case
 
 ### Khi BTC công bố thông số còn thiếu
+
 - ⬜ Cập nhật `fuel_max` → retrain RL với giá trị thật (1-2 tuần)
 - ⬜ Cập nhật `steps_per_day` → re-tune budget allocation trong Lookahead
 - ⬜ Cập nhật `n_teams`, traffic thresholds → re-calibrate traffic model
 
 ### Contest infrastructure
-- ⬜ Fallback chain hoàn chỉnh và tested dưới time pressure:
+
+- ✅ Fallback chain hoàn chỉnh trong `src/main.py`:
   ```
-  MCTS (chạy đến timeout)
+  MCTS (chạy đến timeout, --mcts flag)
     ↓ exception hoặc timeout
   RL policy (deterministic, ~50ms)
     ↓ exception
@@ -191,9 +206,9 @@
     ↓ exception
   Greedy (~1ms) ← không bao giờ crash
   ```
-- ⬜ Pre-submit pattern: submit Greedy ngay khi nhận state (~100ms), override bằng bài tốt hơn nếu còn thời gian
+- ✅ Pre-submit pattern: Greedy tính trước ngay khi nhận state, dùng làm fallback_orders
 - ⬜ Retry logic: nếu server báo invalid → fix và submit lại trong time_limit
-- ⬜ Debug logger: lưu toàn bộ (state, orders, response) mỗi ngày → replay sau trận
+- ✅ Debug logger: `replay/recorder.py` + `replay/player.py` lưu JSON mỗi ngày → replay sau trận
 - ⬜ Edge case testing:
   - map chỉ 1 series → chiến thuật hoàn toàn khác
   - fuel_max rất thấp → supply car critical
@@ -201,6 +216,7 @@
   - tất cả spot bị đội khác khai thác nhanh → phải linh hoạt
 
 ### Checkpoint cuối tháng 3
+
 ```
 ✓ Tournament: MCTS > RL > Lookahead > Greedy (hoặc ít nhất MCTS ≥ RL)
 ✓ Toàn bộ fallback chain tested, không crash dưới time pressure
@@ -212,13 +228,13 @@
 
 ## Điểm quyết định quan trọng
 
-| Thời điểm | Câu hỏi | Nếu NO |
-|---|---|---|
-| Tuần 2 tháng 1 | Simulator pass hết unit test? | Dừng mọi thứ, fix trước |
-| Cuối tháng 1 | Lookahead > Greedy trên benchmark? | Debug lookahead |
-| Giữa tháng 2 | RL > Greedy trên map 8×8? | Debug reward shaping / architecture |
-| Cuối tháng 2 | RL > Lookahead trên map 16×16? | Không làm MCTS, tập trung tune RL + Lookahead hybrid |
-| Giữa tháng 3 | MCTS > RL? | Bỏ MCTS, dùng RL làm primary |
+| Thời điểm      | Câu hỏi                            | Nếu NO                                               |
+| -------------- | ---------------------------------- | ---------------------------------------------------- |
+| Tuần 2 tháng 1 | Simulator pass hết unit test?      | Dừng mọi thứ, fix trước                              |
+| Cuối tháng 1   | Lookahead > Greedy trên benchmark? | Debug lookahead                                      |
+| Giữa tháng 2   | RL > Greedy trên map 8×8?          | Debug reward shaping / architecture                  |
+| Cuối tháng 2   | RL > Lookahead trên map 16×16?     | Không làm MCTS, tập trung tune RL + Lookahead hybrid |
+| Giữa tháng 3   | MCTS > RL?                         | Bỏ MCTS, dùng RL làm primary                         |
 
 ---
 

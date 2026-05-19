@@ -3,22 +3,28 @@ Actor-Critic network for HEXA UDON.
 
 Architecture:
   Map encoder : CNN over 2D hex grid feature planes → spatial embedding
-  Agent encoder: MLP over (agent_fuel, agent_type, spatial_embed_at_agent_cell)
-  Global encoder: concat(all_agent_features, collected_mask, day_info) → MLP
-  Actor head : softmax over (n_spots + 1) choices per agent
-                 (last = STAY / no target for this agent)
-  Critic head: scalar V(state)
+  Agent MLP   : per-agent (spatial_embed + fuel_features + type) → agent_feat
+  Global MLP  : mean_pool(agent_feats) + collected_mask + day_info → global_feat
+  Actor head  : (agent_feat + global_feat) → logits over (max_spots + 1) choices
+  Critic head : global_feat → scalar V(state)
 
-Input channels per cell (C_in = 9):
-  0  terrain_plain    (binary)
-  1  terrain_mountain (binary)
-  2  terrain_road     (binary)
-  3  traffic_clear    (binary, road only)
-  4  traffic_busy     (binary, road only)
-  5  traffic_congested(binary, road only)
-  6  has_spot         (binary)
-  7  series_collected (binary, 1 if spot here belongs to already-collected series)
-  8  spot_inventory_norm (float 0..1)
+Variable-map support:
+  Network dimensions are fixed to (max_spots, max_series, max_width, max_height).
+  Maps smaller than the max are zero-padded. Invalid spot slots (index ≥ actual
+  n_spots on this map) are masked to -inf before sampling so they're never chosen.
+  The STAY action always lives at index max_spots (never masked).
+
+Input channels per cell (C_IN = 10):
+  0  terrain_plain      binary
+  1  terrain_mountain   binary
+  2  terrain_road       binary
+  3  traffic_clear      binary (road only)
+  4  traffic_busy       binary (road only)
+  5  traffic_congested  binary (road only)
+  6  has_spot           binary
+  7  series_collected   binary (spot's series already in collected_series)
+  8  spot_inventory_norm float 0..1
+  9  opponent_present   binary (opponent agent at this cell)
 """
 from __future__ import annotations
 
@@ -26,37 +32,22 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-import math
-from typing import Dict, List, Optional, Tuple
+from typing import List, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 import config as C
-from env.models import DayState, MapData, MatchConfig
 from env.hex_grid import HexGrid
+from env.models import DayState, MapData, MatchConfig
 
 
-C_IN = 9   # feature channels per cell
-
-# Fuel features fed to the agent MLP.
-# We use relative/categorical features instead of raw fuel/fuel_max to avoid
-# sensitivity to fuel_max, which BTC has not yet published.
-#
-# Features (4 values):
-#   [0] can_reach_nearest_spot   : binary — can agent reach ≥1 spot with current fuel?
-#   [1] fuel_tier_low            : binary — fuel ≤ 25% of observed session max
-#   [2] fuel_tier_mid            : binary — fuel in (25%, 75%] of observed session max
-#   [3] fuel_tier_high           : binary — fuel > 75% of observed session max
-#
-# "observed session max" = highest fuel seen for any patrol in day 1 of this episode.
-# This is self-calibrating: once day-1 state is seen, tier thresholds auto-adjust.
-FUEL_FEAT_DIM = 4
+C_IN          = 10   # feature channels per cell (9 map + 1 opponent presence)
+FUEL_FEAT_DIM = 4    # categorical fuel features (see _fuel_features)
 
 
 class MapEncoder(nn.Module):
-    """CNN that encodes the 2D hex grid into per-cell embeddings."""
+    """CNN: (B, C_IN, H, W) → (B, hidden, H, W). Padding=1 keeps spatial size."""
 
     def __init__(self, hidden: int):
         super().__init__()
@@ -70,41 +61,45 @@ class MapEncoder(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, C_IN, H, W) → out: (B, hidden, H, W)
         return self.conv(x)
 
 
 class ActorCritic(nn.Module):
     """
-    Centralized Critic, per-agent Actor (shared weights across agents).
+    Centralized Critic, per-agent Actor (weights shared across agents).
 
-    n_spots: number of spot choices (action 0..n_spots-1 = target spot index,
-             action n_spots = STAY/no-op for this agent).
+    Initialised with max dimensions so the same network trains across
+    maps of different sizes and spot counts.
+
+    Args:
+        max_spots  : maximum number of spots any training map will have
+        max_series : maximum number of series any training map will have
+        max_width  : maximum map width
+        max_height : maximum map height
+        hidden     : hidden dimension for all MLPs
     """
 
     def __init__(
         self,
-        cfg: MatchConfig,
-        map_data: MapData,
-        hidden: int = C.HIDDEN_DIM,
+        max_spots:  int = 30,
+        max_series: int = 10,
+        max_width:  int = 32,
+        max_height: int = 32,
+        hidden:     int = C.HIDDEN_DIM,
     ):
         super().__init__()
-        self.cfg      = cfg
-        self.map      = map_data
-        self.hidden   = hidden
-        self.n_spots  = len(map_data.spots)
-        self.n_series = map_data.n_series
-        self.grid     = HexGrid(cfg.width, cfg.height)
-        # _fuel_max: used only to compute tier thresholds for fuel features.
-        # Self-calibrates each episode from the max patrol fuel seen on day 1.
-        # Falls back to 20 until first episode data arrives.
-        self._fuel_max: int = cfg.fuel_max if cfg.fuel_max else 20
+        self.max_spots  = max_spots
+        self.max_series = max_series
+        self.max_width  = max_width
+        self.max_height = max_height
+        self.hidden     = hidden
+
+        # Observed fuel_max for tier thresholds; updated each episode via set_fuel_max().
+        self._fuel_max: int = 20
 
         self.map_encoder = MapEncoder(hidden)
 
-        # Agent MLP: spatial_embed + fuel_features (FUEL_FEAT_DIM) + agent_type (1)
-        # Using categorical fuel features instead of raw fuel/fuel_max ratio so
-        # the model is robust to unknown fuel_max (see FUEL_FEAT_DIM comment above).
+        # Agent MLP: cell_embed(hidden) + fuel_feats(4) + agent_type(1)
         self.agent_mlp = nn.Sequential(
             nn.Linear(hidden + FUEL_FEAT_DIM + 1, hidden),
             nn.ReLU(),
@@ -112,10 +107,8 @@ class ActorCritic(nn.Module):
             nn.ReLU(),
         )
 
-        # Global MLP: concat all per-agent features + collected_mask + day_info
-        # We handle variable n_agents by pooling agent features.
-        # global_in = hidden//2 (mean agent pool) + n_series + 3 (day, steps, days_left)
-        global_in = hidden // 2 + self.n_series + 3
+        # Global MLP: mean_pool_agents(hidden//2) + collected_mask(max_series) + day_info(3)
+        global_in = hidden // 2 + max_series + 3
         self.global_mlp = nn.Sequential(
             nn.Linear(global_in, hidden),
             nn.ReLU(),
@@ -123,52 +116,58 @@ class ActorCritic(nn.Module):
             nn.ReLU(),
         )
 
-        # Actor head: for each agent, score each spot + STAY
-        self.actor_head = nn.Linear(hidden // 2 + hidden, self.n_spots + 1)
+        # Actor: outputs max_spots + 1 logits (slots 0..max_spots-1 = spots, max_spots = STAY)
+        self.actor_head  = nn.Linear(hidden // 2 + hidden, max_spots + 1)
+
+        # Critic: scalar value estimate
+        self.critic_head = nn.Linear(hidden, 1)
+
+    # ------------------------------------------------------------------ #
+    # Helpers                                                              #
+    # ------------------------------------------------------------------ #
 
     def set_fuel_max(self, fuel_max: int) -> None:
         self._fuel_max = fuel_max
 
     def _fuel_features(self, agent, state: DayState) -> torch.Tensor:
         """
-        Categorical fuel features that don't depend on knowing fuel_max exactly.
-
-        For supply cars, returns all zeros (fuel is irrelevant).
-        For patrol cars:
-          [0] can_reach_any_spot : 1 if fuel ≥ min fuel cost to move at all
-          [1] tier_low           : fuel ≤ 25% of _fuel_max
-          [2] tier_mid           : 25% < fuel ≤ 75% of _fuel_max
-          [3] tier_high          : fuel > 75% of _fuel_max
+        4 categorical fuel features robust to unknown fuel_max.
+          [0] can_move    : fuel ≥ 1 (can move at all)
+          [1] tier_low    : fuel ≤ 25 % of _fuel_max
+          [2] tier_mid    : 25 % < fuel ≤ 75 %
+          [3] tier_high   : fuel > 75 %
+        Supply cars return all zeros (fuel irrelevant for them).
         """
         feats = torch.zeros(FUEL_FEAT_DIM)
         if not agent.is_patrol():
             return feats
-
         fuel = agent.fuel
         fm   = max(self._fuel_max, 1)
-
-        # tier thresholds are relative → robust even if _fuel_max is off
-        lo = fm * 0.25
-        hi = fm * 0.75
-        feats[0] = 1.0 if fuel >= 1 else 0.0   # can move at all
-        feats[1] = 1.0 if fuel <= lo else 0.0
+        lo, hi = fm * 0.25, fm * 0.75
+        feats[0] = 1.0 if fuel >= 1      else 0.0
+        feats[1] = 1.0 if fuel <= lo     else 0.0
         feats[2] = 1.0 if lo < fuel <= hi else 0.0
-        feats[3] = 1.0 if fuel > hi else 0.0
+        feats[3] = 1.0 if fuel > hi      else 0.0
         return feats
 
-        # Critic head
-        self.critic_head = nn.Linear(hidden, 1)
-
     # ------------------------------------------------------------------ #
-    # Encoding                                                             #
+    # Map encoding (variable size → padded to max)                        #
     # ------------------------------------------------------------------ #
 
-    def encode_map(self, state: DayState) -> torch.Tensor:
-        """Build (1, C_IN, H, W) feature tensor from current state."""
-        H, W = self.cfg.height, self.cfg.width
-        feat = torch.zeros(1, C_IN, H, W)
+    def encode_map(
+        self,
+        state:    DayState,
+        map_data: MapData,
+        cfg:      MatchConfig,
+    ) -> torch.Tensor:
+        """
+        Build (1, C_IN, max_height, max_width) feature tensor.
+        Cells beyond the actual map dimensions stay zero-padded.
+        """
+        feat = torch.zeros(1, C_IN, self.max_height, self.max_width)
+        W = cfg.width
 
-        for cell in self.map.cells:
+        for cell in map_data.cells:
             r, c = divmod(cell.id, W)
             t = cell.terrain
             if t == C.TERRAIN_PLAIN:
@@ -180,7 +179,7 @@ class ActorCritic(nn.Module):
                 status = state.traffic.get(cell.id, C.TRAFFIC_CLEAR)
                 feat[0, 3 + status, r, c] = 1.0
 
-        for spot in self.map.spots:
+        for spot in map_data.spots:
             r, c = divmod(spot.cell_id, W)
             feat[0, 6, r, c] = 1.0
             if spot.series_id in state.collected_series:
@@ -188,88 +187,106 @@ class ActorCritic(nn.Module):
             inv = state.spot_inventory.get(spot.cell_id, 0)
             feat[0, 8, r, c] = inv / max(spot.max_inventory, 1)
 
+        # Channel 9: opponent agent presence
+        for cell_id in state.opponent_cells:
+            r, c = divmod(cell_id, W)
+            if 0 <= r < self.max_height and 0 <= c < self.max_width:
+                feat[0, 9, r, c] = 1.0
+
         return feat
+
+    # ------------------------------------------------------------------ #
+    # Forward                                                              #
+    # ------------------------------------------------------------------ #
 
     def forward(
         self,
-        state: DayState,
-        agent_indices: List[int],   # which agents to compute actor for
+        state:         DayState,
+        map_data:      MapData,
+        cfg:           MatchConfig,
+        agent_indices: List[int],
     ) -> Tuple[List[torch.Tensor], torch.Tensor]:
         """
         Returns:
-          logits_list: list of (1, n_spots+1) logit tensors, one per agent in agent_indices
-          value:       (1, 1) scalar
+          logits_list : one (1, max_spots+1) tensor per agent in agent_indices
+                        (invalid spots already masked to -inf)
+          value       : (1,) scalar
         """
-        H, W = self.cfg.height, self.cfg.width
+        W = cfg.width
+        n_spots  = len(map_data.spots)
+        series_ids = map_data.series_ids
 
         # --- map encoding ---
-        map_feat = self.encode_map(state)            # (1, C_IN, H, W)
-        spatial  = self.map_encoder(map_feat)         # (1, hidden, H, W)
-
-        agents_by_id = state.agents_by_id()
+        map_feat = self.encode_map(state, map_data, cfg)   # (1, C_IN, maxH, maxW)
+        spatial  = self.map_encoder(map_feat)               # (1, hidden, maxH, maxW)
 
         # --- per-agent encoding ---
         agent_feats: List[torch.Tensor] = []
         for agent in state.my_agents:
-            r, c = divmod(agent.cell, W)
-            cell_embed  = spatial[0, :, r, c]                          # (hidden,)
-            fuel_feats  = self._fuel_features(agent, state)            # (FUEL_FEAT_DIM,)
-            atype       = torch.tensor([float(agent.type)])
-            x = torch.cat([cell_embed, fuel_feats, atype])             # (hidden+FUEL_FEAT_DIM+1,)
-            af = self.agent_mlp(x.unsqueeze(0))                        # (1, hidden//2)
+            r, c       = divmod(agent.cell, W)
+            cell_embed = spatial[0, :, r, c]                          # (hidden,)
+            fuel_feats = self._fuel_features(agent, state)            # (4,)
+            atype      = torch.tensor([float(agent.type)])
+            x  = torch.cat([cell_embed, fuel_feats, atype])           # (hidden+5,)
+            af = self.agent_mlp(x.unsqueeze(0))                       # (1, hidden//2)
             agent_feats.append(af)
 
-        # Pool agent features (mean) for global context
-        pooled = torch.stack(agent_feats).mean(0)             # (1, hidden//2)
+        pooled = torch.stack(agent_feats).mean(0)   # (1, hidden//2)
 
-        # --- global context ---
-        collected_vec = torch.zeros(self.n_series)
-        for i, sid in enumerate(self.map.series_ids):
+        # --- global context (padded to max_series) ---
+        collected_vec = torch.zeros(self.max_series)
+        for i, sid in enumerate(series_ids[:self.max_series]):
             if sid in state.collected_series:
                 collected_vec[i] = 1.0
 
         day_info = torch.tensor([
-            state.day / self.cfg.total_days,
-            state.steps_left / max(self.cfg.steps_per_day),
-            (self.cfg.total_days - state.day) / self.cfg.total_days,
+            state.day / max(cfg.total_days, 1),
+            state.steps_left / max(max(cfg.steps_per_day), 1),
+            (cfg.total_days - state.day) / max(cfg.total_days, 1),
         ])
-        global_in = torch.cat([pooled.squeeze(0), collected_vec, day_info])
-        global_feat = self.global_mlp(global_in.unsqueeze(0))  # (1, hidden)
+        global_in   = torch.cat([pooled.squeeze(0), collected_vec, day_info])
+        global_feat = self.global_mlp(global_in.unsqueeze(0))   # (1, hidden)
 
-        # --- actor: one set of logits per requested agent ---
+        # --- actor logits with invalid-slot masking ---
+        # Slots n_spots .. max_spots-1 are padding (not real spots) → mask to -inf
+        # Slot max_spots is always STAY → never masked
         logits_list: List[torch.Tensor] = []
         for aid in agent_indices:
-            # Find agent feature
-            idx = next(i for i, a in enumerate(state.my_agents) if a.id == aid)
-            af  = agent_feats[idx]                              # (1, hidden//2)
-            combined = torch.cat([af, global_feat], dim=-1)    # (1, hidden//2+hidden)
-            logits = self.actor_head(combined)                  # (1, n_spots+1)
+            idx      = next(i for i, a in enumerate(state.my_agents) if a.id == aid)
+            af       = agent_feats[idx]                             # (1, hidden//2)
+            combined = torch.cat([af, global_feat], dim=-1)        # (1, hidden//2+hidden)
+            logits   = self.actor_head(combined).clone()           # (1, max_spots+1)
+
+            # Mask padding slots (keep real spots 0..n_spots-1 and STAY at max_spots)
+            if n_spots < self.max_spots:
+                logits[0, n_spots:self.max_spots] = float("-inf")
+
             logits_list.append(logits)
 
         # --- critic ---
-        value = self.critic_head(global_feat)                   # (1, 1)
-
+        value = self.critic_head(global_feat)   # (1, 1)
         return logits_list, value
 
     def get_action_and_value(
         self,
-        state: DayState,
+        state:         DayState,
+        map_data:      MapData,
+        cfg:           MatchConfig,
         agent_indices: List[int],
         deterministic: bool = False,
     ) -> Tuple[List[int], torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Sample or argmax actions. Returns:
-          actions     : list of int (spot index or n_spots=STAY) per agent
-          log_probs   : (n_agents,) tensor
-          entropy     : (n_agents,) tensor
-          value       : scalar tensor
+        Sample (or argmax) one action per patrol agent.
+
+        Returns:
+          actions   : list of int — spot index (0..n_spots-1) or max_spots (STAY)
+          log_probs : (n_agents,)
+          entropy   : (n_agents,)
+          value     : scalar tensor
         """
-        logits_list, value = self.forward(state, agent_indices)
+        logits_list, value = self.forward(state, map_data, cfg, agent_indices)
 
-        actions: List[int] = []
-        log_probs_list: List[torch.Tensor] = []
-        entropy_list:   List[torch.Tensor] = []
-
+        actions, log_probs_list, entropy_list = [], [], []
         for logits in logits_list:
             dist = torch.distributions.Categorical(logits=logits.squeeze(0))
             a    = dist.mode if deterministic else dist.sample()
