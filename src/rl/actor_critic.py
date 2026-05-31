@@ -126,6 +126,11 @@ class ActorCritic(nn.Module):
     # Helpers                                                              #
     # ------------------------------------------------------------------ #
 
+    @property
+    def device(self) -> torch.device:
+        """Return the device of the model parameters."""
+        return next(self.parameters()).device
+
     def set_fuel_max(self, fuel_max: int) -> None:
         self._fuel_max = fuel_max
 
@@ -138,7 +143,7 @@ class ActorCritic(nn.Module):
           [3] tier_high   : fuel > 75 %
         Supply cars return all zeros (fuel irrelevant for them).
         """
-        feats = torch.zeros(FUEL_FEAT_DIM)
+        feats = torch.zeros(FUEL_FEAT_DIM, device=self.device)
         if not agent.is_patrol():
             return feats
         fuel = agent.fuel
@@ -164,7 +169,7 @@ class ActorCritic(nn.Module):
         Build (1, C_IN, max_height, max_width) feature tensor.
         Cells beyond the actual map dimensions stay zero-padded.
         """
-        feat = torch.zeros(1, C_IN, self.max_height, self.max_width)
+        feat = torch.zeros(1, C_IN, self.max_height, self.max_width, device=self.device)
         W = cfg.width
 
         for cell in map_data.cells:
@@ -226,7 +231,7 @@ class ActorCritic(nn.Module):
             r, c       = divmod(agent.cell, W)
             cell_embed = spatial[0, :, r, c]                          # (hidden,)
             fuel_feats = self._fuel_features(agent, state)            # (4,)
-            atype      = torch.tensor([float(agent.type)])
+            atype      = torch.tensor([float(agent.type)], device=self.device)
             x  = torch.cat([cell_embed, fuel_feats, atype])           # (hidden+5,)
             af = self.agent_mlp(x.unsqueeze(0))                       # (1, hidden//2)
             agent_feats.append(af)
@@ -234,7 +239,7 @@ class ActorCritic(nn.Module):
         pooled = torch.stack(agent_feats).mean(0)   # (1, hidden//2)
 
         # --- global context (padded to max_series) ---
-        collected_vec = torch.zeros(self.max_series)
+        collected_vec = torch.zeros(self.max_series, device=self.device)
         for i, sid in enumerate(series_ids[:self.max_series]):
             if sid in state.collected_series:
                 collected_vec[i] = 1.0
@@ -243,7 +248,7 @@ class ActorCritic(nn.Module):
             state.day / max(cfg.total_days, 1),
             state.steps_left / max(max(cfg.steps_per_day), 1),
             (cfg.total_days - state.day) / max(cfg.total_days, 1),
-        ])
+        ], device=self.device)
         global_in   = torch.cat([pooled.squeeze(0), collected_vec, day_info])
         global_feat = self.global_mlp(global_in.unsqueeze(0))   # (1, hidden)
 

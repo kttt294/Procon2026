@@ -134,13 +134,12 @@ def run_train(args):
         trainer.load(args.load)
 
     trainer.train(
-        n_episodes = args.episodes,
-        seed       = args.seed,
-        log_every  = args.log_every,
+        n_episodes  = args.episodes,
+        seed        = args.seed,
+        log_every   = args.log_every,
+        save_every  = args.save_every,
+        save_path   = args.save or "",
     )
-
-    if args.save:
-        trainer.save(args.save)
 
 
 def run_play(args):
@@ -276,6 +275,8 @@ def main():
     tr.add_argument("--selfplay",      action="store_true", help="Enable self-play opponent pool")
     tr.add_argument("--selfplay-every",type=int,   default=1000, dest="selfplay_every",
                     help="Add checkpoint to self-play pool every N episodes")
+    tr.add_argument("--save-every",    type=int,   default=500,  dest="save_every",
+                    help="Auto-save checkpoint every N episodes (0 = only at end)")
 
     # play
     pl = sub.add_parser("play", help="Connect to contest server")

@@ -35,7 +35,7 @@ N_DIRECTIONS = 6
 # RL hyperparameters
 HIDDEN_DIM    = 256
 LR_ACTOR      = 3e-4
-LR_CRITIC     = 1e-3
+LR_CRITIC     = 3e-4
 GAMMA         = 0.99
 GAE_LAMBDA    = 0.95
 CLIP_EPS      = 0.2

@@ -114,7 +114,7 @@ GPU: Tesla T4
 
 ## 5. Chạy training
 
-### Chạy cơ bản (curriculum + selfplay, lưu vào Drive)
+### Chạy cơ bản (curriculum + selfplay, tự động lưu vào Drive)
 
 ```python
 %cd /content/procon2026
@@ -126,9 +126,12 @@ GPU: Tesla T4
   --device cuda \
   --seed 42 \
   --log-every 100 \
+  --save-every 500 \
   --log-dir /content/runs/mappo \
   --save /content/drive/MyDrive/procon2026/model.pt
 ```
+
+`--save-every 500` tự động ghi checkpoint vào Drive **mỗi 500 episode** — không cần làm gì thêm, không mất data khi Colab timeout.
 
 ### Các tham số quan trọng
 
@@ -139,6 +142,7 @@ GPU: Tesla T4
 | `--selfplay` | flag | Bật self-play pool |
 | `--device cuda` | cuda | Dùng GPU |
 | `--start-level` | 0–4 | Level bắt đầu (0=8×8, 4=32×32) |
+| `--save-every` | 500 | Tự động lưu checkpoint mỗi N episode |
 | `--selfplay-every` | 1000 | Thêm checkpoint vào pool mỗi N episode |
 | `--seed` | 42 | Seed để reproduce |
 
@@ -180,28 +184,7 @@ Mở trong một cell riêng **trong khi training đang chạy**:
 
 ## 7. Lưu và resume checkpoint
 
-### Tự động lưu định kỳ (tránh mất data khi timeout)
-
-Thêm cell này **trước** cell chạy training, chạy trong background:
-
-```python
-import threading, time, subprocess
-
-def auto_save_loop(interval_min=15):
-    """Lưu checkpoint vào Drive mỗi interval_min phút."""
-    while True:
-        time.sleep(interval_min * 60)
-        subprocess.run([
-            "cp",
-            "/content/procon2026/model.pt",   # đổi nếu save path khác
-            "/content/drive/MyDrive/procon2026/model_backup.pt"
-        ])
-        print(f"[auto-save] Backed up to Drive")
-
-t = threading.Thread(target=auto_save_loop, args=(15,), daemon=True)
-t.start()
-print("Auto-save thread started (every 15 min)")
-```
+`--save-every 500 --save /content/drive/MyDrive/procon2026/model.pt` đã đủ — training tự ghi vào Drive mỗi 500 episode, không cần làm gì thêm.
 
 ### Sau mỗi session — kiểm tra checkpoint còn không
 

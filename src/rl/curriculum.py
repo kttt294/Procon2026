@@ -45,7 +45,7 @@ LEVELS: List[CurriculumLevel] = [
     CurriculumLevel(5, width=32, height=32, total_days=10, n_agents=8, n_patrol=5, n_series=8, n_spots=20),
 ]
 
-ADVANCE_THRESHOLD = 0.60   # RL must beat Lookahead ≥ 60 % of recent episodes
+ADVANCE_THRESHOLD = 0.50   # RL must beat Lookahead ≥ 50 % of recent episodes
 WIN_WINDOW        = 100    # rolling window size
 MIN_SAMPLES       = 30     # minimum episodes before advancing is possible
 

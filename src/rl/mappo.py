@@ -171,7 +171,9 @@ class MAPPOTrainer:
         n_episodes:          int = 1000,
         seed:                int = 42,
         log_every:           int = 50,
-        eval_baseline_every: int = 10,   # how often to evaluate vs Lookahead (curriculum)
+        eval_baseline_every: int = 10,
+        save_every:          int = 500,   # auto-checkpoint every N episodes
+        save_path:           str = "",    # path to save to; empty = no auto-save
     ) -> None:
         ep_shaped:  List[float] = []
         ep_raw:     List[float] = []
@@ -232,14 +234,19 @@ class MAPPOTrainer:
             if (ep + 1) % log_every == 0:
                 n   = log_every
                 lvl = f" lv={self.curriculum.level_number}" if self.curriculum else ""
+                n_series_max = f"/{self.curriculum.level.n_series}" if self.curriculum else ""
                 print(
                     f"Ep {ep+1:5d}{lvl} | "
                     f"shaped={np.mean(ep_shaped[-n:]):.1f}  "
                     f"raw={np.mean(ep_raw[-n:]):.1f}  "
-                    f"series={np.mean(ep_series[-n:]):.2f}  "
+                    f"series={np.mean(ep_series[-n:]):.2f}{n_series_max}  "
                     f"udon={np.mean(ep_udon[-n:]):.1f}"
                     + (f"  loss={losses.get('total', 0):.4f}" if losses else "")
                 )
+
+            # --- Auto-checkpoint ---
+            if save_path and save_every > 0 and (ep + 1) % save_every == 0:
+                self.save(save_path)
 
         if self.writer is not None:
             self.writer.flush()
@@ -356,9 +363,9 @@ class MAPPOTrainer:
 
     def _update(self) -> Dict[str, float]:
         returns, advantages = self.buffer.compute_returns()
-        adv_t = torch.tensor(advantages, dtype=torch.float32)
+        adv_t = torch.tensor(advantages, dtype=torch.float32, device=self.device)
         adv_t = (adv_t - adv_t.mean()) / (adv_t.std() + 1e-8)
-        ret_t = torch.tensor(returns,    dtype=torch.float32)
+        ret_t = torch.tensor(returns,    dtype=torch.float32, device=self.device)
 
         total_loss   = 0.0
         total_actor  = 0.0
@@ -382,7 +389,7 @@ class MAPPOTrainer:
                 critic_loss  = (new_value - ret_t[i]).pow(2)
                 entropy_loss = -new_entropy.mean()
 
-                loss = actor_loss + 0.5 * critic_loss + C.ENTROPY_COEF * entropy_loss
+                loss = actor_loss + 0.1 * critic_loss + C.ENTROPY_COEF * entropy_loss
                 self.optimizer.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
