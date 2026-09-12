@@ -5,14 +5,13 @@ Architecture:
   Map encoder : CNN over 2D hex grid feature planes → spatial embedding
   Agent MLP   : per-agent (spatial_embed + fuel_features + type) → agent_feat
   Global MLP  : mean_pool(agent_feats) + collected_mask + day_info → global_feat
-  Actor head  : (agent_feat + global_feat) → logits over (max_spots + 1) choices
+  Actor head  : (agent_feat + global_feat) → logits over (n_spots + 1) choices
   Critic head : global_feat → scalar V(state)
 
 Variable-map support:
-  Network dimensions are fixed to (max_spots, max_series, max_width, max_height).
-  Maps smaller than the max are zero-padded. Invalid spot slots (index ≥ actual
-  n_spots on this map) are masked to -inf before sampling so they're never chosen.
-  The STAY action always lives at index max_spots (never masked).
+  Spatial maps are padded to (max_height, max_width). Pointer logits follow the
+  actual spot count; STAY is always index n_spots. max_spots is kept only for
+  compatibility with existing checkpoint metadata.
 
 Input channels per cell (C_IN = 10):
   0  terrain_plain      binary
@@ -32,7 +31,7 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -72,7 +71,7 @@ class ActorCritic(nn.Module):
     maps of different sizes and spot counts.
 
     Args:
-        max_spots  : maximum number of spots any training map will have
+        max_spots  : legacy checkpoint metadata; does not limit pointer targets
         max_series : maximum number of series any training map will have
         max_width  : maximum map width
         max_height : maximum map height
@@ -183,6 +182,8 @@ class ActorCritic(nn.Module):
         Build (1, C_IN, max_height, max_width) feature tensor.
         Cells beyond the actual map dimensions stay zero-padded.
         """
+        if cfg.width > self.max_width or cfg.height > self.max_height:
+            raise ValueError("Map dimensions exceed model capacity")
         feat = torch.zeros(1, C_IN, self.max_height, self.max_width, device=self.device)
         W = cfg.width
 
@@ -227,8 +228,7 @@ class ActorCritic(nn.Module):
     ) -> Tuple[List[torch.Tensor], torch.Tensor]:
         """
         Returns:
-          logits_list : one (1, max_spots+1) tensor per agent in agent_indices
-                        (invalid spots already masked to -inf)
+          logits_list : one (1, n_spots+1) tensor per agent in agent_indices
           value       : (1,) scalar
         """
         W = cfg.width
@@ -275,22 +275,18 @@ class ActorCritic(nn.Module):
             combined = torch.cat([af, global_feat], dim=-1)        # (1, hidden//2+hidden)
             query    = self.query_mlp(combined)                     # (1, hidden)
 
-            # Compute logits for all max_spots
-            logits   = torch.zeros(1, self.max_spots + 1, device=self.device)
+            # Pointer weights are independent of the number of spots.
+            logits   = torch.zeros(1, n_spots + 1, device=self.device)
             
-            for i in range(self.max_spots):
-                if i < n_spots:
-                    cell_id = map_data.spots[i].cell_id
-                    r_spot, c_spot = divmod(cell_id, W)
-                    spot_embed = spatial[0, :, r_spot, c_spot]      # (hidden,)
-                    key = self.key_mlp(spot_embed.unsqueeze(0))     # (1, hidden)
-                    logits[0, i] = (query * key).sum(dim=-1)
-                else:
-                    # Mask padding slots
-                    logits[0, i] = float("-inf")
+            for i in range(n_spots):
+                cell_id = map_data.spots[i].cell_id
+                r_spot, c_spot = divmod(cell_id, W)
+                spot_embed = spatial[0, :, r_spot, c_spot]      # (hidden,)
+                key = self.key_mlp(spot_embed.unsqueeze(0))     # (1, hidden)
+                logits[0, i] = (query * key).sum(dim=-1)
 
-            # STAY action (index max_spots)
-            logits[0, self.max_spots] = self.stay_head(query).squeeze(-1)
+            # STAY follows the last actual spot, matching every order decoder.
+            logits[0, n_spots] = self.stay_head(query).squeeze(-1)
             logits_list.append(logits)
 
         # --- critic ---
@@ -304,29 +300,33 @@ class ActorCritic(nn.Module):
         cfg:           MatchConfig,
         agent_indices: List[int],
         deterministic: bool = False,
+        actions: Optional[List[int]] = None,
     ) -> Tuple[List[int], torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Sample (or argmax) one action per patrol agent.
 
         Returns:
-          actions   : list of int — spot index (0..n_spots-1) or max_spots (STAY)
+          actions   : list of int — spot index (0..n_spots-1) or n_spots (STAY)
           log_probs : (n_agents,)
           entropy   : (n_agents,)
           value     : scalar tensor
         """
         logits_list, value = self.forward(state, map_data, cfg, agent_indices)
 
-        actions, log_probs_list, entropy_list = [], [], []
-        for logits in logits_list:
+        if actions is not None and len(actions) != len(agent_indices):
+            raise ValueError("One action is required per patrol")
+        chosen, log_probs_list, entropy_list = [], [], []
+        for i, logits in enumerate(logits_list):
             dist = torch.distributions.Categorical(logits=logits.squeeze(0))
-            a    = dist.mode if deterministic else dist.sample()
-            actions.append(a.item())
+            a = (torch.tensor(actions[i], device=self.device) if actions is not None
+                 else dist.mode if deterministic else dist.sample())
+            chosen.append(a.item())
             log_probs_list.append(dist.log_prob(a))
             entropy_list.append(dist.entropy())
 
         return (
-            actions,
-            torch.stack(log_probs_list),
-            torch.stack(entropy_list),
+            chosen,
+            torch.stack(log_probs_list) if log_probs_list else torch.empty(0, device=self.device),
+            torch.stack(entropy_list) if entropy_list else torch.empty(0, device=self.device),
             value.squeeze(),
         )

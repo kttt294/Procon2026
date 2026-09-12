@@ -18,6 +18,7 @@ from typing import List, Tuple
 from env.map_generator import MapGenConfig, MatchGenConfig, generate_scenario
 from env.models import AgentState, MapData, MatchConfig
 from env.simulator import HexaUdonSimulator
+from env.scoring import Score, compute_score
 from strategy.lookahead import LookaheadPlanner
 
 
@@ -64,7 +65,7 @@ class CurriculumEngine:
             cfg, map_data, agents = curriculum.generate_scenario(seed=seed + ep)
             ...run episode...
             baseline = curriculum.evaluate_baseline(cfg, map_data, agents)
-            curriculum.record(rl_series, baseline)
+            curriculum.record(rl_score, baseline)
             curriculum.try_advance()
     """
 
@@ -123,9 +124,9 @@ class CurriculumEngine:
         cfg:      MatchConfig,
         map_data: MapData,
         agents:   List[AgentState],
-    ) -> int:
+    ) -> Score:
         """
-        Run LookaheadPlanner on the same scenario and return unique_series.
+        Run LookaheadPlanner on the same scenario and return its contest score.
         Used to compare against RL performance.
         """
         import copy
@@ -135,15 +136,15 @@ class CurriculumEngine:
         while not sim.is_done(state):
             orders = planner.plan(state)
             state, _ = sim.apply_day(state, orders)
-        return len(state.collected_series)
+        return compute_score(state)
 
     # ------------------------------------------------------------------ #
     # Win tracking                                                         #
     # ------------------------------------------------------------------ #
 
-    def record(self, rl_series: int, baseline_series: int) -> None:
-        """Record whether RL matched or beat the Lookahead baseline."""
-        self._wins.append(int(rl_series >= baseline_series))
+    def record(self, rl_score: Score, baseline_score: Score) -> None:
+        """A tie is not a win; compare all three contest score criteria."""
+        self._wins.append(int(rl_score > baseline_score))
         self._total += 1
 
     def try_advance(self) -> bool:

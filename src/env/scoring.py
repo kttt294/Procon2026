@@ -16,6 +16,18 @@ from dataclasses import dataclass
 from typing import List
 
 from env.models import DayState
+import config as C
+
+
+def collection_potential(state, map_data, grid) -> float:
+    """Potential used by training; also converts the critic back to raw reward."""
+    uncollected = [s for s in map_data.spots if s.series_id not in state.collected_series]
+    patrols = state.patrol_agents()
+    if not uncollected or not patrols:
+        return 0.0
+    distance = sum(min(grid.hex_distance(a.cell, s.cell_id) for s in uncollected)
+                   for a in patrols)
+    return -C.POTENTIAL_SCALE * distance / len(patrols)
 
 
 @dataclass

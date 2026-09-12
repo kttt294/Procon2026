@@ -17,11 +17,14 @@ import argparse
 import sys
 import os
 import time
+from copy import deepcopy
 
 sys.path.insert(0, os.path.dirname(__file__))
 
 from env.models import AgentState, DayOrder, MatchConfig, MapData
 from env.simulator import HexaUdonSimulator
+from env.validator import validate_orders
+from env.scoring import compute_score
 from strategy.greedy import GreedyPlanner
 from strategy.lookahead import LookaheadPlanner
 
@@ -153,8 +156,6 @@ def run_play(args):
        -> Greedy (~1ms, never crashes)
     """
     from client.http_client import ContestClient
-    from rl.mappo import MAPPOTrainer
-
     client = ContestClient(base_url=args.url)
 
     print("[play] Fetching match config...")
@@ -167,59 +168,67 @@ def run_play(args):
     use_rl = args.model and os.path.exists(args.model)
     rl_model = None
     if use_rl:
-        trainer = MAPPOTrainer(device="cpu")
-        trainer.load(args.model)
-        rl_model = trainer.model
-        rl_model.eval()
-        print("[play] RL model loaded.")
+        try:
+            from rl.mappo import MAPPOTrainer
+            trainer = MAPPOTrainer(device="cpu", log_dir=None)
+            trainer.load(args.model)
+            rl_model = trainer.model
+            rl_model.eval()
+            print("[play] RL model loaded.")
+        except Exception as e:
+            print(f"[play] Model unavailable, using heuristics: {e}")
 
     mcts_planner = None
-    if use_rl and getattr(args, "mcts", False):
+    if rl_model is not None and getattr(args, "mcts", False):
         from strategy.mcts import MCTSPlanner
         mcts_planner = MCTSPlanner(cfg, map_data, sim, rl_model, time_budget_ms=2500)
         print("[play] MCTS enabled.")
 
     def _rl_plan(state):
+        import torch
         patrol_ids = [a.id for a in state.patrol_agents()]
-        actions, _, _, _ = rl_model.get_action_and_value(
-            state, map_data, cfg, patrol_ids, deterministic=True,
-        )
+        with torch.no_grad():
+            actions, _, _, _ = rl_model.get_action_and_value(
+                state, map_data, cfg, patrol_ids, deterministic=True,
+            )
         return trainer._actions_to_orders(state, map_data, cfg, sim, patrol_ids, actions)
 
     def safe_plan(state, time_limit_ms):
         """Try MCTS -> RL -> Lookahead -> Greedy."""
+        deadline = time.monotonic() + time_limit_ms / 1000
         # Tier 1: MCTS
         if mcts_planner is not None:
             try:
-                mcts_planner._time_budget_ms = max(500, time_limit_ms - 800)
+                mcts_planner._time_budget_ms = max(0, time_limit_ms - 200)
                 return mcts_planner.plan(state)
             except Exception as e:
                 print(f"[play] MCTS error: {e}")
 
         # Tier 2: RL policy
-        if rl_model is not None:
+        if rl_model is not None and time.monotonic() < deadline:
             try:
                 return _rl_plan(state)
             except Exception as e:
                 print(f"[play] RL error: {e}")
 
         # Tier 3: Lookahead
-        try:
-            return lookahead.plan(state)
-        except Exception as e:
-            print(f"[play] Lookahead error: {e}")
-
-        # Tier 4: Greedy (must not crash)
-        return greedy.plan(state)
+        if time.monotonic() < deadline:
+            try:
+                return lookahead.plan(state)
+            except Exception as e:
+                print(f"[play] Lookahead error: {e}")
+        return None  # keep the already submitted fallback
 
     prev_state = None
     fuel_max_locked = False
     for day in range(1, cfg.total_days + 1):
         print(f"\n[play] Day {day}")
-        start = time.time()
+        start = time.monotonic()
 
         state = client.get_day_state(day, cfg, map_data, prev_state)
         time_limit_ms = state.time_limit_ms
+        if day == 1 and cfg.fuel_max is None:
+            cfg.infer_fuel_max(state.my_agents)
 
         # Day 1: read fuel_max from initial agent states and set model normalization.
         if day == 1 and not fuel_max_locked and rl_model is not None:
@@ -230,19 +239,43 @@ def run_play(args):
             fuel_max_locked = True
 
         # Pre-submit greedy immediately (~1ms) as a safe placeholder
-        greedy_orders = greedy.plan(state)
-
-        # Main planning (MCTS -> RL -> Lookahead -> Greedy)
-        orders = safe_plan(state, time_limit_ms)
+        try:
+            greedy_orders = greedy.plan(state)
+            if not validate_orders(greedy_orders, state, map_data, sim.grid)[0]:
+                greedy_orders = []
+        except Exception as e:
+            print(f"[play] Greedy error, submitting empty orders: {e}")
+            greedy_orders = []
 
         resp = client.submit_with_retry(
             day             = day,
-            orders          = orders,
-            fallback_orders = greedy_orders,
+            orders          = greedy_orders,
+            fallback_orders = [],
             deadline_ms     = time_limit_ms,
             start_ms        = start,
         )
-        elapsed = (time.time() - start) * 1000
+        deadline = start + time_limit_ms / 1000
+        accepted_orders = resp.get('_accepted_orders', greedy_orders)
+        remaining_ms = (deadline - time.monotonic()) * 1000 - 200
+        if resp.get('status') == 'valid' and remaining_ms > 0:
+            orders = safe_plan(state, remaining_ms)
+            if orders is not None and orders != accepted_orders:
+                ok, errors = validate_orders(orders, state, map_data, sim.grid)
+                if not ok:
+                    print(f"[play] Rejected local plan: {errors}")
+                else:
+                    # Only replace an accepted fallback with a better daily score.
+                    baseline, _ = deepcopy(sim).apply_day(state, accepted_orders)
+                    candidate, _ = deepcopy(sim).apply_day(state, orders)
+                    remaining = deadline - time.monotonic() - .05
+                    if compute_score(candidate) > compute_score(baseline) and remaining > 0:
+                        try:
+                            improved = client.submit_orders(day, orders, timeout_s=remaining)
+                            if improved.get('status') == 'valid':
+                                resp = improved
+                        except Exception as e:
+                            print(f"[play] Improvement submit failed; fallback retained: {e}")
+        elapsed = (time.monotonic() - start) * 1000
         print(f"[play] Submitted — status={resp.get('status')}  elapsed={elapsed:.0f}ms")
         prev_state = state
 

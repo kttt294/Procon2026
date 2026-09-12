@@ -188,7 +188,7 @@ Nếu quá hạn, server lấy bài valid cuối cùng (hoặc coi như không n
 
 | Rule | Mô tả |
 |---|---|
-| Tổng step tiêu thụ ≤ `steps_left` | Mỗi lệnh move tốn step theo terrain đích |
+| Tổng step tiêu thụ ≤ `steps_left` | Mỗi lệnh move tốn step theo terrain nguồn |
 | Nhiên liệu xe tuần tra ≥ 0 | Mỗi move tốn fuel theo terrain nguồn |
 | Không di chuyển vào ao (terrain=2) | Server báo invalid |
 | Agent không cần order | Mặc định STAY cả ngày nếu không có trong `orders` |
@@ -198,7 +198,7 @@ Nếu quá hạn, server lấy bài valid cuối cùng (hoặc coi như không n
 
 ## Chi phí di chuyển
 
-| Terrain đích | Step tiêu thụ | Fuel tiêu thụ (xe tuần tra) |
+| Terrain nguồn | Step tiêu thụ | Fuel tiêu thụ (xe tuần tra) |
 |---|---|---|
 | Đồng bằng (0) | 2 | 1 |
 | Núi (1) | 3 | 2 |
@@ -207,7 +207,7 @@ Nếu quá hạn, server lấy bài valid cuối cùng (hoặc coi như không n
 | Đường đông (3, status=1) | 2 | 2 |
 | Đường kẹt xe (3, status=2) | 4 | 2 |
 
-**Lưu ý**: Step tính theo terrain **đích** (ô đang bước vào), fuel tính theo terrain **nguồn** (ô đang đứng trước khi di chuyển).
+**Lưu ý**: Step tính theo terrain **nguồn** (ô đang đứng trước khi di chuyển), fuel tính theo terrain **nguồn** (ô đang đứng trước khi di chuyển).
 
 ---
 

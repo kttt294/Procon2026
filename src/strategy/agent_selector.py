@@ -5,18 +5,13 @@ Given N starting positions (fixed by BTC), decides:
   1. How many patrol cars vs supply cars (split ratio)
   2. Which starting position gets which type
 
-Approach: brute-force simulate candidate assignments on the actual match map,
-score by avg unique_series over N_SIM quick games, pick the best.
-
-Feasibility: N ≤ 8 agents → at most C(8,4)=70 position assignments × 7 splits
-= ~500 combos × N_SIM=20 games = ~10k simulations.
-Each simulation is fast (Lookahead on random rollout ≈ milliseconds).
-Total runtime < 60s → well within pre-match preparation time.
+Approach: evaluate candidate assignments on the actual match map with full
+initial fuel and compare the three contest score criteria lexicographically.
+The rollout still has no refuelling until BTC publishes its mechanics.
 """
 from __future__ import annotations
 
 import itertools
-import random
 import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
@@ -28,12 +23,8 @@ import config as C
 from env.hex_grid import HexGrid
 from env.models import AgentState, Cell, MapData, MatchConfig, Spot
 from env.simulator import HexaUdonSimulator
+from env.scoring import Score, compute_score
 from strategy.lookahead import LookaheadPlanner
-
-
-# How many simulated games to evaluate each candidate assignment.
-# Higher = more accurate but slower. 20 is a good trade-off.
-N_SIM = 20
 
 
 @dataclass
@@ -42,7 +33,7 @@ class AgentAssignment:
     types: Dict[int, int]          # agent_id -> AGENT_PATROL or AGENT_SUPPLY
     n_patrol: int
     n_supply: int
-    score: float                   # avg unique_series across N_SIM games
+    score: Score                   # contest ordering, including both score tie-breaks
 
     def as_agent_states(
         self,
@@ -100,8 +91,7 @@ class AgentSelector:
         candidates = self._generate_candidates(agent_ids, start_cells, n)
 
         if verbose:
-            print(f"[selector] Evaluating {len(candidates)} candidate assignments "
-                  f"({N_SIM} sims each)...")
+            print(f"[selector] Evaluating {len(candidates)} candidate assignments...")
 
         best: Optional[AgentAssignment] = None
 
@@ -121,7 +111,7 @@ class AgentSelector:
             if verbose:
                 print(f"  patrol={n_patrol} supply={n_supply} "
                       f"positions={[start_cells[i] for i,a in enumerate(agent_ids) if types_map[a]==C.AGENT_PATROL]} "
-                      f"→ score={score:.2f}")
+                      f"→ {score}")
 
             if best is None or score > best.score:
                 best = AgentAssignment(
@@ -149,16 +139,14 @@ class AgentSelector:
 
         Rules:
           - At least 1 patrol (otherwise no udon collection).
-          - At least 1 supply if n >= 3 (otherwise patrol will always run dry).
+          - All-patrol is allowed; the published rules do not require a supply.
           - Skip duplicates caused by identical starting positions.
         """
         candidates = []
         seen_position_splits = set()
 
-        for n_patrol in range(1, n):
+        for n_patrol in range(1, n + 1):
             n_supply = n - n_patrol
-            if n_supply < 1 and n >= 3:
-                continue
 
             # Score each position for suitability as patrol vs supply
             patrol_scores  = [self._patrol_score(cell, start_cells) for cell in start_cells]
@@ -221,6 +209,8 @@ class AgentSelector:
         if len(all_starts) <= 1:
             return 0.0
         others = [c for c in all_starts if c != cell]
+        if not others:
+            return 0.0
         max_dist = max(self.grid.hex_distance(cell, other) for other in others)
         return 1.0 / (max_dist + 1)
 
@@ -228,36 +218,16 @@ class AgentSelector:
     # Simulation                                                           #
     # ------------------------------------------------------------------ #
 
-    def _simulate_score(self, agents: List[AgentState], fuel_max: int) -> float:
+    def _simulate_score(self, agents: List[AgentState], fuel_max: int) -> Score:
         """
-        Run N_SIM quick games with the Lookahead planner.
-        Returns average unique_series collected.
+        Evaluate the actual initial fuel and compare all contest score fields.
+        The simulator is deterministic, so repeated identical rollouts add no evidence.
         """
         if self.cfg.fuel_max is None:
             self.cfg.fuel_max = fuel_max
 
-        total = 0.0
-        for _ in range(N_SIM):
-            # Randomise map slightly each sim to get a robust estimate
-            state = self.sim.reset(_jitter_agents(agents))
-            while not self.sim.is_done(state):
-                orders = self._planner.plan(state)
-                state, _ = self.sim.apply_day(state, orders)
-            total += len(state.collected_series)
-
-        return total / N_SIM
-
-
-# ------------------------------------------------------------------ #
-# Helper                                                               #
-# ------------------------------------------------------------------ #
-
-def _jitter_agents(agents: List[AgentState]) -> List[AgentState]:
-    """Return a shallow copy with fuel slightly randomised (±10%) for robustness."""
-    from copy import deepcopy
-    result = deepcopy(agents)
-    for a in result:
-        if a.is_patrol() and a.fuel > 0:
-            jitter = random.uniform(0.9, 1.0)
-            a.fuel = max(1, int(a.fuel * jitter))
-    return result
+        state = self.sim.reset(agents)
+        while not self.sim.is_done(state):
+            orders = self._planner.plan(state)
+            state, _ = self.sim.apply_day(state, orders)
+        return compute_score(state)

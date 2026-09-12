@@ -8,7 +8,8 @@ Search uses:
   - Actor network logits  to generate K candidate joint actions per node
   - Critic network value  to evaluate leaf nodes (no random rollout)
   - UCB1                  to balance exploration vs exploitation
-  - Time budget           search runs until deadline - 500 ms, then returns best
+  - Time budget           checked between inference, expansion and simulation;
+                          the caller reserves time for submission
 
 Usage:
     planner = MCTSPlanner(cfg, map_data, sim, model, time_budget_ms=2500)
@@ -30,7 +31,8 @@ import torch
 
 import config as C
 from env.models import DayOrder, DayState, MapData, MatchConfig
-from env.simulator import HexaUdonSimulator
+from env.simulator import HexaUdonSimulator, TrafficModel
+from env.scoring import collection_potential
 from pathfinding.astar import multi_waypoint_path, find_path
 from strategy.greedy import GreedyPlanner
 from strategy.planner import BasePlanner
@@ -51,6 +53,7 @@ class MCTSNode:
     children:   List["MCTSNode"] = field(default_factory=list, repr=False)
     visits:     int   = 0
     value_sum:  float = 0.0
+    traffic: Optional[TrafficModel] = field(default=None, repr=False)
 
     @property
     def is_terminal(self) -> bool:
@@ -115,16 +118,19 @@ class MCTSPlanner(BasePlanner):
         Returns the DayOrders of the most-visited child of the root.
         Falls back to greedy if tree has no children (e.g., terminal state).
         """
-        deadline = time.time() + self._time_budget_ms / 1000.0
+        deadline = time.monotonic() + self._time_budget_ms / 1000.0
         root     = MCTSNode(state=state, parent=None, orders=[], reward=0.0, depth=0)
+        root.traffic = copy.deepcopy(self.sim.traffic)
 
         iterations = 0
-        while time.time() < deadline:
+        while time.monotonic() < deadline:
             node = self._select(root)
             if not self.sim.is_done(node.state) and node.depth < self._max_depth:
-                children = self._expand(node)
+                children = self._expand(node, deadline)
                 if children:
                     node = children[0]   # evaluate first new child
+            if time.monotonic() >= deadline:
+                break
             value = self._evaluate(node)
             self._backup(node, value)
             iterations += 1
@@ -147,11 +153,13 @@ class MCTSPlanner(BasePlanner):
             node = max(node.children, key=lambda n: n.ucb1(self._c))
         return node
 
-    def _expand(self, node: MCTSNode) -> List[MCTSNode]:
+    def _expand(self, node: MCTSNode, deadline: float = float('inf')) -> List[MCTSNode]:
         """
         Generate up to beam_width child nodes by sampling diverse joint actions
         from the actor network, then executing them through the simulator.
         """
+        if time.monotonic() >= deadline:
+            return []
         state      = node.state
         patrol_ids = [a.id for a in state.patrol_agents()]
         n_spots    = len(self.map.spots)
@@ -165,7 +173,7 @@ class MCTSPlanner(BasePlanner):
         children: List[MCTSNode] = []
 
         for _ in range(self._beam * 6):   # over-sample to find K distinct ones
-            if len(children) >= self._beam:
+            if len(children) >= self._beam or time.monotonic() >= deadline:
                 break
             actions = []
             for logits in logits_list:
@@ -178,7 +186,11 @@ class MCTSPlanner(BasePlanner):
             seen.add(key)
 
             orders              = self._build_orders(state, patrol_ids, actions)
-            next_state, reward  = self.sim.apply_day(copy.deepcopy(state), orders)
+            if time.monotonic() >= deadline:
+                break
+            branch_sim = HexaUdonSimulator(self.cfg, self.map)
+            branch_sim.traffic = copy.deepcopy(node.traffic if node.traffic is not None else self.sim.traffic)
+            next_state, reward = branch_sim.apply_day(state, orders)
 
             children.append(MCTSNode(
                 state   = next_state,
@@ -186,6 +198,7 @@ class MCTSPlanner(BasePlanner):
                 orders  = orders,
                 reward  = reward,
                 depth   = node.depth + 1,
+                traffic = branch_sim.traffic,
             ))
 
         node.children = children
@@ -193,24 +206,25 @@ class MCTSPlanner(BasePlanner):
 
     def _evaluate(self, node: MCTSNode) -> float:
         """
-        Value estimate: immediate reward + gamma * critic(state).
-        For terminal nodes, only the cumulative reward matters.
+        Continuation value at this state; edge rewards are added in backup.
+        A terminal state has no future reward.
         """
         if self.sim.is_done(node.state):
-            return node.reward
+            return 0.0
 
         with torch.no_grad():
             patrol_ids = [a.id for a in node.state.patrol_agents()]
             _, value   = self._model.forward(node.state, self.map, self.cfg, patrol_ids)
-        return node.reward + C.GAMMA * value.item()
+        # Training uses r + gamma*phi(next) - phi(now), so V_raw = V_shaped + phi.
+        return value.item() + collection_potential(node.state, self.map, self.grid)
 
     def _backup(self, node: MCTSNode, value: float) -> None:
         """Propagate value up to the root."""
         cur = node
         while cur is not None:
+            value          = cur.reward + C.GAMMA * value
             cur.visits    += 1
             cur.value_sum += value
-            value          = cur.reward + C.GAMMA * value
             cur            = cur.parent
 
     # ------------------------------------------------------------------ #

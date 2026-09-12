@@ -63,9 +63,9 @@ class ContestClient:
         resp = self._get(f"/state/day/{day}")
         return self._parse_state(resp, cfg, map_data, prev_state)
 
-    def submit_orders(self, day: int, orders: List[DayOrder]) -> dict:
+    def submit_orders(self, day: int, orders: List[DayOrder], timeout_s: Optional[float] = None) -> dict:
         payload = {"orders": [o.to_dict() for o in orders]}
-        resp = self._post(f"/action/day/{day}", payload)
+        resp = self._post(f"/action/day/{day}", payload, timeout_s)
         return resp
 
     def submit_with_retry(
@@ -78,16 +78,17 @@ class ContestClient:
     ) -> dict:
         """
         Try to submit orders. If invalid, retry with fallback.
-        Gives up submitting ~200 ms before deadline.
+        start_ms is a time.monotonic() timestamp in seconds (legacy name).
+        Keep 50 ms for response handling; at most two attempts.
         """
         for attempt, o in enumerate([orders, fallback_orders]):
-            elapsed = (time.time() - start_ms) * 1000
-            if elapsed > deadline_ms - 200:
+            remaining = start_ms + deadline_ms / 1000 - time.monotonic() - .05
+            if remaining <= 0:
                 break
             try:
-                resp = self.submit_orders(day, o)
+                resp = self.submit_orders(day, o, timeout_s=remaining)
                 if resp.get("status") == "valid":
-                    return resp
+                    return {**resp, "_accepted_orders": o}
             except Exception as e:
                 print(f"[client] submit attempt {attempt+1} failed: {e}")
         return {"status": "failed"}
@@ -151,8 +152,11 @@ class ContestClient:
         resp.raise_for_status()
         return resp.json()
 
-    def _post(self, path: str, body: dict) -> dict:
+    def _post(self, path: str, body: dict, timeout_s: Optional[float] = None) -> dict:
         url = self.base + path
-        resp = self.session.post(url, json=body, timeout=self.timeout)
+        timeout = self.timeout if timeout_s is None else min(self.timeout, timeout_s)
+        if timeout <= 0:
+            raise TimeoutError("Submission deadline expired")
+        resp = self.session.post(url, json=body, timeout=timeout)
         resp.raise_for_status()
         return resp.json()

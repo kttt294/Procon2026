@@ -26,7 +26,7 @@ from typing import Dict, List, Tuple
 
 import config as C
 from env.hex_grid import HexGrid
-from env.models import CMD_MOVE, DayOrder, DayState, MapData
+from env.models import CMD_MOVE, CMD_STAY, DayOrder, DayState, MapData
 
 
 def validate_orders(
@@ -48,8 +48,13 @@ def validate_orders(
     errors: List[str] = []
     agents_by_id = state.agents_by_id()
     steps_used = 0
+    seen_ids = set()
 
     for order in orders:
+        if order.agent_id in seen_ids:
+            errors.append(f"agent {order.agent_id}: duplicate order")
+            continue
+        seen_ids.add(order.agent_id)
         agent = agents_by_id.get(order.agent_id)
         if agent is None:
             errors.append(f"agent {order.agent_id}: not found in state")
@@ -59,11 +64,16 @@ def validate_orders(
         fuel_used = 0
 
         for i, action in enumerate(order.actions):
+            if action.cmd == CMD_STAY:
+                if action.direction is not None:
+                    errors.append(f"agent {order.agent_id}: stay cannot have a direction")
+                continue
             if action.cmd != CMD_MOVE:
+                errors.append(f"agent {order.agent_id}: unknown command {action.cmd!r}")
                 continue
 
             # --- direction validity ---
-            if action.direction is None or action.direction not in range(C.N_DIRECTIONS):
+            if type(action.direction) is not int or action.direction not in range(C.N_DIRECTIONS):
                 errors.append(
                     f"agent {order.agent_id} step {i}: "
                     f"invalid direction {action.direction!r}"

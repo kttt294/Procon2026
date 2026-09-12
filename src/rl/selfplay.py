@@ -121,6 +121,7 @@ class SelfPlayPool:
 
         road_steps: Dict[int, float] = {}
         new_cells:  Dict[int, int]   = {a.id: a.cell for a in opp_agents}
+        steps_left = state.steps_left
 
         for aid, act in zip(patrol_ids, actions):
             agent = agents_by_id[aid]
@@ -131,20 +132,23 @@ class SelfPlayPool:
             result = find_path(
                 grid, terrain, state.traffic,
                 agent.cell, target,
-                step_budget=state.steps_left,
+                step_budget=steps_left,
                 fuel_budget=agent.fuel,
             )
             if not result.reachable:
                 continue
 
             cur = agent.cell
-            for direction in result.actions:
+            for action in result.actions:
                 if terrain.get(cur) == C.TERRAIN_ROAD:
-                    road_steps[cur] = road_steps.get(cur, 0.0) + 1.0
-                nxt = grid.neighbor_in_dir(cur, direction)
+                    cost = C.STEP_COST[C.TERRAIN_ROAD][state.traffic.get(cur, C.TRAFFIC_CLEAR)]
+                    road_steps[cur] = road_steps.get(cur, 0.0) + cost
+                nxt = grid.neighbor_in_dir(cur, action.direction)
                 if nxt is not None:
                     cur = nxt
             new_cells[aid] = cur
+            agent.fuel -= result.total_fuel
+            steps_left -= result.total_steps
 
         return list(new_cells.values()), road_steps
 
@@ -168,7 +172,8 @@ class SelfPlayPool:
         occupied   = set(our_cells)
         candidates = [
             c.id for c in map_data.cells
-            if c.terrain != C.TERRAIN_LAKE and c.id not in occupied
+            if c.terrain == C.TERRAIN_PLAIN and c.id not in occupied
+            and c.id not in map_data.spot_map
         ]
         rng      = random.Random(seed)
         n_place  = min(n_agents, len(candidates))

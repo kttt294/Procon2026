@@ -56,6 +56,9 @@ def find_path(
     Returns PathResult with the sequence of AgentActions.
     If dst is unreachable within budgets, returns PathResult.unreachable().
     """
+    if (step_budget < 0 or (fuel_budget is not None and fuel_budget < 0)
+            or terrain.get(src, C.TERRAIN_LAKE) == C.TERRAIN_LAKE):
+        return PathResult.unreachable()
     if src == dst:
         return PathResult([], 0, 0, True)
 
@@ -79,34 +82,19 @@ def find_path(
     def heuristic(cell_id: int) -> int:
         return grid.hex_distance(cell_id, dst) * 1
 
-    # State: (f, g_steps, g_fuel, cell, parent_cell, direction_taken)
-    # We minimize total steps (g_steps). Fuel is a constraint, not objective.
-    INF = float("inf")
-
-    # best_g[cell] = (best_steps_so_far, best_fuel_so_far_at_that_steps)
-    best_g: Dict[int, Tuple[int, int]] = {}
-
-    # heap: (f, g_steps, g_fuel, cell)
-    heap: List[Tuple] = []
-    heapq.heappush(heap, (heuristic(src), 0, 0, src))
-
-    # For path reconstruction
-    came_from: Dict[int, Tuple[int, int]] = {}   # cell -> (parent_cell, direction)
+    # Each label is immutable: (cell, steps, fuel). Keep all non-dominated
+    # costs when fuel is constrained, and parents belonging to that exact label.
+    labels = {src: {(0, 0)}}
+    heap = [(heuristic(src), 0, 0, src)]
+    came_from = {}
 
     while heap:
         f, g_steps, g_fuel, cur = heapq.heappop(heap)
-
+        label = (cur, g_steps, g_fuel)
+        if (g_steps, g_fuel) not in labels[cur]:
+            continue
         if cur == dst:
-            return _reconstruct(came_from, dst, g_steps, g_fuel)
-
-        # Prune if we've seen this cell with better cost
-        if cur in best_g:
-            prev_steps, prev_fuel = best_g[cur]
-            if g_steps > prev_steps:
-                continue
-            if g_steps == prev_steps and g_fuel >= prev_fuel:
-                continue
-        best_g[cur] = (g_steps, g_fuel)
+            return _reconstruct(came_from, label, g_steps, g_fuel)
 
         sc = step_cost(cur)   # cost of leaving cur
         fc = fuel_cost(cur)   # fuel of leaving cur
@@ -124,14 +112,14 @@ def find_path(
             if fuel_budget is not None and new_fuel > fuel_budget:
                 continue
 
-            if nbr in best_g:
-                ps, pf = best_g[nbr]
-                if new_steps > ps:
-                    continue
-                if new_steps == ps and new_fuel >= pf:
-                    continue
-
-            came_from[nbr] = (cur, direction)
+            costs = labels.setdefault(nbr, set())
+            if any(s <= new_steps and (fuel_budget is None or f <= new_fuel)
+                   for s, f in costs):
+                continue
+            costs.difference_update({(s, f) for s, f in costs
+                                     if new_steps <= s and (fuel_budget is None or new_fuel <= f)})
+            costs.add((new_steps, new_fuel))
+            came_from[(nbr, new_steps, new_fuel)] = (label, direction)
             h = heuristic(nbr)
             heapq.heappush(heap, (new_steps + h, new_steps, new_fuel, nbr))
 
@@ -139,8 +127,8 @@ def find_path(
 
 
 def _reconstruct(
-    came_from: Dict[int, Tuple[int, int]],
-    dst: int,
+    came_from: dict,
+    dst: tuple,
     total_steps: int,
     total_fuel: int,
 ) -> PathResult:
@@ -173,6 +161,29 @@ def multi_waypoint_path(
     fuel_left  = fuel_budget
 
     for wp in waypoints:
+        # A spot at the day's starting cell must be entered again. A zero-hop
+        # shortest path is correct for travel, but does not count as a visit.
+        if wp == cur and not all_actions:
+            loops = []
+            for _, nbr in grid.neighbors(cur):
+                outward = find_path(grid, terrain, traffic, cur, nbr, steps_left, fuel_left)
+                if not outward.reachable:
+                    continue
+                inward = find_path(grid, terrain, traffic, nbr, cur,
+                                   steps_left - outward.total_steps,
+                                   None if fuel_left is None else fuel_left - outward.total_fuel)
+                if inward.reachable:
+                    loops.append(PathResult(outward.actions + inward.actions,
+                                            outward.total_steps + inward.total_steps,
+                                            outward.total_fuel + inward.total_fuel, True))
+            if not loops:
+                break
+            result = min(loops, key=lambda p: (p.total_steps, p.total_fuel))
+            all_actions.extend(result.actions)
+            steps_left -= result.total_steps
+            if fuel_left is not None:
+                fuel_left -= result.total_fuel
+            continue
         result = find_path(
             grid, terrain, traffic, cur, wp,
             step_budget=steps_left,

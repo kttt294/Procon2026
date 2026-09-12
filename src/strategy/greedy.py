@@ -66,11 +66,10 @@ class GreedyPlanner(BasePlanner):
                 fuel_budget=agent.fuel,
             )
             orders.append(DayOrder(agent_id=agent.id, actions=actions))
-            # Rough step deduction (shared budget; exact tracking is in simulator)
-            steps_remaining = max(0, steps_remaining - sum(
-                self.sim._step_cost(agent.cell, state.traffic)
-                for _ in actions
-            ))
+            cur = agent.cell
+            for action in actions:
+                steps_remaining -= self.sim._step_cost(cur, state.traffic)
+                cur = self.grid.neighbor_in_dir(cur, action.direction)
 
         # Build actions for supply cars
         for agent in state.supply_agents():
@@ -86,6 +85,8 @@ class GreedyPlanner(BasePlanner):
                     fuel_budget=None,
                 )
                 actions = result.actions if result.reachable else []
+                if result.reachable:
+                    steps_remaining -= result.total_steps
             else:
                 actions = []
             orders.append(DayOrder(agent_id=agent.id, actions=actions))

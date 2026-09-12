@@ -312,23 +312,12 @@ class LookaheadPlanner(BasePlanner):
         Divide the shared step budget across agents.
 
         Strategy:
-          - Estimate steps each patrol needs via hex distance (optimistic lower bound).
+          - Divide steps by patrol priority, without a geometric distance cap.
           - Patrols going to uncollected series get priority (larger share).
           - Supply cars share the leftover.
         """
         total      = state.steps_left
         uncollected = set(self.map.series_ids) - state.collected_series
-
-        # Rough step estimate per patrol (hex_distance × min_cost_per_hex)
-        estimates: Dict[int, int] = {}
-        for patrol in patrols:
-            wps  = assignments.get(patrol.id, [])
-            dist = 0
-            cur  = patrol.cell
-            for wp in wps:
-                dist += self.grid.hex_distance(cur, wp)
-                cur   = wp
-            estimates[patrol.id] = max(dist, 1)   # at least 1 to avoid div-by-zero
 
         # Assign weight: 2× for patrols targeting an uncollected series
         def weight(patrol: AgentState) -> float:
@@ -345,9 +334,7 @@ class LookaheadPlanner(BasePlanner):
 
         for patrol in patrols:
             share = int(total * weight(patrol) / total_weight)
-            # Cap at 1.5× the estimated need so we don't starve others
-            cap   = int(estimates[patrol.id] * 1.5)
-            budgets[patrol.id] = max(min(share, cap), estimates[patrol.id])
+            budgets[patrol.id] = share
 
         supply_pool = max(0, total - sum(budgets[p.id] for p in patrols))
         per_supply  = supply_pool // max(len(supplies), 1)
@@ -377,10 +364,12 @@ class LookaheadPlanner(BasePlanner):
 
         # Calculate actual steps used so far and find the correct final cell
         steps_used = 0
+        fuel_used = 0
         cur_cell = patrol.cell
         for act in actions:
             if act.cmd == "move":
                 steps_used += self.sim._step_cost(cur_cell, state.traffic)
+                fuel_used += self.sim._fuel_cost(cur_cell)
                 dst = self.grid.neighbor_in_dir(cur_cell, act.direction)
                 if dst is not None:
                     cur_cell = dst
@@ -418,7 +407,7 @@ class LookaheadPlanner(BasePlanner):
             end_cell,
             next_target,
             step_budget=remaining,
-            fuel_budget=None,   # repositioning ignores fuel (patrol may need tiếp tế anyway)
+            fuel_budget=max(0, patrol.fuel - fuel_used),
         )
 
         if reposition_result.reachable:
@@ -606,5 +595,3 @@ class LookaheadPlanner(BasePlanner):
             cur = best_nbr
 
         return cur if cur != patrol_cell else None
-
-

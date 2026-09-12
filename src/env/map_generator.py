@@ -20,7 +20,7 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import List, Optional, Tuple
 
 import config as C
@@ -77,7 +77,8 @@ def generate_scenario(
     map_cfg   = map_cfg   or MapGenConfig()
     match_cfg = match_cfg or MatchGenConfig()
 
-    map_data = _generate_map(rng, map_cfg)
+    map_cfg = replace(map_cfg, max_inventory=min(map_cfg.max_inventory, n_agents))
+    map_data = _generate_map(rng, map_cfg, n_agents)
     cfg      = _generate_config(map_cfg, match_cfg)
     agents   = _generate_agents(rng, map_data, cfg, n_agents, n_patrol)
     return cfg, map_data, agents
@@ -85,10 +86,10 @@ def generate_scenario(
 
 def generate_random_scenario(
     seed:          int,
-    width_range:   Tuple[int, int] = (8,  24),
-    height_range:  Tuple[int, int] = (8,  24),
-    days_range:    Tuple[int, int] = (4,  8),
-    agents_range:  Tuple[int, int] = (3,  6),
+    width_range:   Tuple[int, int] = (8,  32),
+    height_range:  Tuple[int, int] = (8,  32),
+    days_range:    Tuple[int, int] = (4,  10),
+    agents_range:  Tuple[int, int] = (3,  8),
 ) -> Tuple[MatchConfig, MapData, List[AgentState]]:
     """
     Generate a fully random scenario — size, days, and agent count all randomised.
@@ -96,8 +97,8 @@ def generate_random_scenario(
     """
     rng = random.Random(seed)
 
-    w        = rng.randrange(width_range[0],  width_range[1]  + 1, 2)
-    h        = rng.randrange(height_range[0], height_range[1] + 1, 2)
+    w        = rng.randint(*width_range)
+    h        = rng.randint(*height_range)
     n_days   = rng.randint(*days_range)
     n_agents = rng.randint(*agents_range)
     n_patrol = max(1, rng.randint(1, max(1, n_agents - 1)))
@@ -125,7 +126,7 @@ def generate_random_scenario(
         fuel_max   = rng.randint(15, 30),
     )
 
-    map_data = _generate_map(rng, map_cfg)
+    map_data = _generate_map(rng, map_cfg, n_agents)
     cfg      = _generate_config(map_cfg, match_cfg)
     agents   = _generate_agents(rng, map_data, cfg, n_agents, n_patrol)
     return cfg, map_data, agents
@@ -135,18 +136,22 @@ def generate_random_scenario(
 # Internal builders                                                    #
 # ------------------------------------------------------------------ #
 
-def _generate_map(rng: random.Random, cfg: MapGenConfig) -> MapData:
+def _generate_map(rng: random.Random, cfg: MapGenConfig, n_agents: int = 0) -> MapData:
     n = cfg.width * cfg.height
+    if cfg.n_spots + n_agents > n or cfg.n_spots < cfg.n_series or cfg.max_inventory < 1:
+        raise ValueError("Map cannot fit the requested spots, series and starting positions")
     terrain_types   = [C.TERRAIN_PLAIN, C.TERRAIN_MOUNTAIN, C.TERRAIN_LAKE, C.TERRAIN_ROAD]
     terrain_weights = [cfg.plain_ratio, cfg.mountain_ratio, cfg.lake_ratio, cfg.road_ratio]
 
     terrain = rng.choices(terrain_types, weights=terrain_weights, k=n)
+    # Reserve enough plain cells for both spots and non-spot starts.
+    missing = max(0, cfg.n_spots + n_agents - terrain.count(C.TERRAIN_PLAIN))
+    for cid in rng.sample([i for i, t in enumerate(terrain) if t != C.TERRAIN_PLAIN], missing):
+        terrain[cid] = C.TERRAIN_PLAIN
     cells   = [Cell(id=i, terrain=terrain[i]) for i in range(n)]
 
-    # Spots placed only on non-lake cells
-    non_lake = [i for i in range(n) if terrain[i] != C.TERRAIN_LAKE]
-    n_spots  = min(cfg.n_spots, len(non_lake))
-    spot_cells = rng.sample(non_lake, n_spots)
+    plain = [i for i in range(n) if terrain[i] == C.TERRAIN_PLAIN]
+    spot_cells = rng.sample(plain, cfg.n_spots)
 
     # Round-robin series assignment so each series appears at least once
     spots = []
@@ -187,13 +192,10 @@ def _generate_agents(
     spot_cells = {s.cell_id for s in map_data.spots}
     candidates = [
         c.id for c in map_data.cells
-        if c.terrain != C.TERRAIN_LAKE and c.id not in spot_cells
+        if c.terrain == C.TERRAIN_PLAIN and c.id not in spot_cells
     ]
-    # Fallback: if not enough non-spot cells, allow spot cells
     if len(candidates) < n_agents:
-        candidates = [c.id for c in map_data.cells if c.terrain != C.TERRAIN_LAKE]
-
-    n_agents    = min(n_agents, len(candidates))
+        raise ValueError("Not enough plain non-spot starting cells")
     start_cells = rng.sample(candidates, n_agents)
     fuel_max    = cfg.fuel_max or 20
 

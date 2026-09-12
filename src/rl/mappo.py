@@ -12,7 +12,7 @@ Key design decisions:
   - Reward shaping: potential-based phi(s) = -POTENTIAL_SCALE * mean_min_hex_dist
     to nearest uncollected spot (Ng 1999 — provably policy-invariant).
   - TensorBoard logging when available.
-  - fuel_max randomised each episode (BTC value unknown; trains robustness).
+  - fuel_max comes from each generated match config, shared with the baseline.
 """
 from __future__ import annotations
 
@@ -36,6 +36,7 @@ from env.models import (
     AgentState, DayOrder, DayState, MapData, MatchConfig,
 )
 from env.simulator import HexaUdonSimulator
+from env.scoring import compute_score, collection_potential
 from pathfinding.astar import multi_waypoint_path, find_path
 from rl.actor_critic import ActorCritic
 from rl.curriculum import CurriculumEngine
@@ -97,7 +98,7 @@ class RolloutBuffer:
             gae   = delta + gamma * lam * (1 - tr.done) * gae
             advantages[t] = gae
             returns[t]    = gae + v
-            next_val      = 0.0 if tr.done else v
+            next_val      = v
 
         return returns, advantages
 
@@ -118,8 +119,6 @@ class MAPPOTrainer:
         curriculum: CurriculumEngine instance (None = fully random maps)
         selfplay:   SelfPlayPool instance (None = no opponent simulation)
     """
-
-    FUEL_MAX_CANDIDATES = [10, 15, 20, 25, 30]
 
     def __init__(
         self,
@@ -177,6 +176,9 @@ class MAPPOTrainer:
         save_every:          int = 500,   # auto-checkpoint every N episodes
         save_path:           str = "",    # path to save to; empty = no auto-save
     ) -> None:
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
         ep_shaped:  List[float] = []
         ep_raw:     List[float] = []
         ep_series:  List[int]   = []
@@ -208,7 +210,7 @@ class MAPPOTrainer:
                 baseline = self.curriculum.evaluate_baseline(
                     cfg, map_data, copy.deepcopy(agents)
                 )
-                self.curriculum.record(ep_info["unique_series"], baseline)
+                self.curriculum.record(ep_info["score"], baseline)
                 advanced = self.curriculum.try_advance()
                 if advanced and self.writer:
                     self.writer.add_scalar(
@@ -263,8 +265,8 @@ class MAPPOTrainer:
         map_data: MapData,
         agents:   List[AgentState],
         seed:     int = 0,
-    ) -> Dict[str, float]:
-        fuel_max = random.choice(self.FUEL_MAX_CANDIDATES)
+    ) -> dict:
+        fuel_max = cfg.fuel_max or max((a.fuel for a in agents if a.is_patrol()), default=20)
         self.model.set_fuel_max(fuel_max)
         for a in agents:
             if a.is_patrol():
@@ -333,7 +335,7 @@ class MAPPOTrainer:
                 )
 
             done     = sim.is_done(next_state)
-            phi_next = self._compute_potential(next_state, map_data, sim.grid)
+            phi_next = 0.0 if done else self._compute_potential(next_state, map_data, sim.grid)
             shaped_r = reward + C.GAMMA * phi_next - phi_s
             phi_s    = phi_next
 
@@ -357,6 +359,7 @@ class MAPPOTrainer:
             "shaped_return": shaped_total,
             "unique_series": len(state.collected_series),
             "total_udon":    state.total_udon,
+            "score":         compute_score(state),
         }
 
     # ------------------------------------------------------------------ #
@@ -366,7 +369,7 @@ class MAPPOTrainer:
     def _update(self) -> Dict[str, float]:
         returns, advantages = self.buffer.compute_returns()
         adv_t = torch.tensor(advantages, dtype=torch.float32, device=self.device)
-        adv_t = (adv_t - adv_t.mean()) / (adv_t.std() + 1e-8)
+        adv_t = (adv_t - adv_t.mean()) / (adv_t.std(unbiased=False) + 1e-8)
         ret_t = torch.tensor(returns,    dtype=torch.float32, device=self.device)
 
         total_loss   = 0.0
@@ -380,16 +383,17 @@ class MAPPOTrainer:
                 patrol_ids = [a.id for a in tr.state.patrol_agents()]
                 _, new_log_probs, new_entropy, new_value = \
                     self.model.get_action_and_value(
-                        tr.state, tr.map_data, tr.cfg, patrol_ids
+                        tr.state, tr.map_data, tr.cfg, patrol_ids, actions=tr.actions
                     )
 
-                ratio        = (new_log_probs.mean() - tr.log_probs.mean()).exp()
+                # MAPPO: clip each agent's importance ratio for its saved action.
+                ratio        = (new_log_probs - tr.log_probs).exp()
                 adv          = adv_t[i]
                 surr1        = ratio * adv
                 surr2        = torch.clamp(ratio, 1 - C.CLIP_EPS, 1 + C.CLIP_EPS) * adv
-                actor_loss   = -torch.min(surr1, surr2)
+                actor_loss   = -torch.min(surr1, surr2).mean() if patrol_ids else new_value * 0
                 critic_loss  = (new_value - ret_t[i]).pow(2)
-                entropy_loss = -new_entropy.mean()
+                entropy_loss = -new_entropy.mean() if patrol_ids else new_value * 0
 
                 loss = actor_loss + 0.1 * critic_loss + C.ENTROPY_COEF * entropy_loss
                 self.optimizer.zero_grad()
@@ -426,18 +430,7 @@ class MAPPOTrainer:
                   min hex_distance to any spot in an uncollected series.
         Returns 0 when all series collected or no patrol agents exist.
         """
-        uncollected = [
-            s for s in map_data.spots
-            if s.series_id not in state.collected_series
-        ]
-        patrol = list(state.patrol_agents())
-        if not uncollected or not patrol:
-            return 0.0
-
-        total = 0.0
-        for agent in patrol:
-            total += min(grid.hex_distance(agent.cell, s.cell_id) for s in uncollected)
-        return -C.POTENTIAL_SCALE * (total / len(patrol))
+        return collection_potential(state, map_data, grid)
 
     # ------------------------------------------------------------------ #
     # Action -> Orders                                                     #
