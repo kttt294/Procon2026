@@ -223,10 +223,11 @@ class MCTSPlanner(BasePlanner):
         patrol_ids: List[int],
         actions:    List[int],
     ) -> List[DayOrder]:
-        """Convert actor actions (spot indices) to DayOrders via A*."""
+        """Convert actor actions (spot indices) to DayOrders via A* using sequential step allocation."""
         orders:      List[DayOrder] = []
         agents_by_id = state.agents_by_id()
         n_spots      = len(self.map.spots)
+        remaining_shared_steps = state.steps_left
 
         for aid, act in zip(patrol_ids, actions):
             agent = agents_by_id[aid]
@@ -237,21 +238,43 @@ class MCTSPlanner(BasePlanner):
             path_actions = multi_waypoint_path(
                 self.grid, self._terrain, state.traffic,
                 agent.cell, [target],
-                step_budget = state.steps_left,
+                step_budget = remaining_shared_steps,
                 fuel_budget = agent.fuel if agent.is_patrol() else None,
             )
             orders.append(DayOrder(agent_id=aid, actions=path_actions))
+
+            # Calculate actual steps used by this agent's actions
+            actual_steps_used = 0
+            cur_cell = agent.cell
+            for a in path_actions:
+                if a.cmd == "move":
+                    actual_steps_used += self.sim._step_cost(cur_cell, state.traffic)
+                    dst = self.grid.neighbor_in_dir(cur_cell, a.direction)
+                    if dst is not None:
+                        cur_cell = dst
+            remaining_shared_steps = max(0, remaining_shared_steps - actual_steps_used)
 
         for agent in state.supply_agents():
             target = self._greedy._supply_target(agent, state)
             if target is not None:
                 result = find_path(
                     self.grid, self._terrain, state.traffic,
-                    agent.cell, target, step_budget=state.steps_left,
+                    agent.cell, target, step_budget=remaining_shared_steps,
                 )
                 supply_actions = result.actions if result.reachable else []
             else:
                 supply_actions = []
             orders.append(DayOrder(agent_id=agent.id, actions=supply_actions))
+
+            # Calculate actual steps used by this supply car
+            actual_steps_used = 0
+            cur_cell = agent.cell
+            for a in supply_actions:
+                if a.cmd == "move":
+                    actual_steps_used += self.sim._step_cost(cur_cell, state.traffic)
+                    dst = self.grid.neighbor_in_dir(cur_cell, a.direction)
+                    if dst is not None:
+                        cur_cell = dst
+            remaining_shared_steps = max(0, remaining_shared_steps - actual_steps_used)
 
         return orders

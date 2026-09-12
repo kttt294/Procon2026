@@ -54,8 +54,8 @@ class LookaheadPlanner(BasePlanner):
         # Step 1 — global series assignment
         assignments: Dict[int, List[int]] = self._assign_series(patrols, state)
 
-        # Step 2 — allocate step budget
-        budgets: Dict[int, int] = self._allocate_budget(
+        # Step 2 — allocate base step budget (used as base limit)
+        base_budgets: Dict[int, int] = self._allocate_budget(
             patrols, supplies, assignments, state
         )
 
@@ -67,18 +67,86 @@ class LookaheadPlanner(BasePlanner):
         # Step 4 — hybrid fallback: if supply can't reach patrol in time, patrol
         #           adjusts its route to converge toward the supply car instead.
         assignments = self._apply_hybrid_fallback(
-            patrols, supplies, assignments, supply_targets, budgets, state
+            patrols, supplies, assignments, supply_targets, base_budgets, state
         )
 
-        # Step 5 — build patrol orders (highest-value first → budget priority)
-        patrol_orders = self._build_patrol_orders(patrols, assignments, budgets, state)
+        # Step 5 — Sequential planning with dynamic budget
+        orders: List[DayOrder] = []
+        remaining_shared_steps = state.steps_left
+        leftover_steps = 0
 
-        # Step 6 — build supply orders
-        supply_orders = self._build_supply_orders_from_targets(
-            supplies, supply_targets, budgets, state
-        )
+        # Sort agents by priority:
+        # 1. Patrols targeting uncollected series
+        # 2. Other patrols
+        # 3. Supply agents
+        uncollected = set(self.map.series_ids) - state.collected_series
+        
+        def agent_priority(a: AgentState) -> float:
+            if a.is_patrol():
+                wps = assignments.get(a.id, [])
+                if not wps:
+                    return 1.0
+                first = self.map.spot_map.get(wps[0])
+                return 100.0 if (first and first.series_id in uncollected) else 10.0
+            else:
+                return 0.0
 
-        return patrol_orders + supply_orders
+        sorted_agents = sorted(state.my_agents, key=agent_priority, reverse=True)
+        orders_by_id: Dict[int, DayOrder] = {}
+
+        for agent in sorted_agents:
+            base_b = base_budgets.get(agent.id, 0)
+            # The actual budget for this agent is base + leftover capped by remaining shared steps
+            act_budget = min(base_b + leftover_steps, remaining_shared_steps)
+
+            if agent.is_patrol():
+                waypoints = assignments.get(agent.id, [])
+                if not waypoints:
+                    actions = []
+                else:
+                    actions = multi_waypoint_path(
+                        self.grid,
+                        self._terrain,
+                        state.traffic,
+                        agent.cell,
+                        waypoints,
+                        step_budget=act_budget,
+                        fuel_budget=agent.fuel,
+                    )
+                    # End-of-day repositioning
+                    actions = self._append_reposition(agent, waypoints, actions, act_budget, state)
+            else:
+                # Supply agent
+                target = supply_targets.get(agent.id)
+                if target is None:
+                    actions = []
+                else:
+                    result = find_path(
+                        self.grid, self._terrain, state.traffic,
+                        agent.cell, target,
+                        step_budget=act_budget,
+                        fuel_budget=None,
+                    )
+                    actions = result.actions if result.reachable else []
+
+            # Calculate actual steps used by this agent's actions
+            actual_steps_used = 0
+            cur_cell = agent.cell
+            for act in actions:
+                if act.cmd == "move":
+                    actual_steps_used += self.sim._step_cost(cur_cell, state.traffic)
+                    dst = self.grid.neighbor_in_dir(cur_cell, act.direction)
+                    if dst is not None:
+                        cur_cell = dst
+
+            # Update leftover and remaining shared steps
+            leftover_steps = max(0, act_budget - actual_steps_used)
+            remaining_shared_steps = max(0, remaining_shared_steps - actual_steps_used)
+
+            orders_by_id[agent.id] = DayOrder(agent_id=agent.id, actions=actions)
+
+        # Re-assemble orders in the order of state.my_agents for consistency
+        return [orders_by_id[a.id] for a in state.my_agents]
 
     # ------------------------------------------------------------------ #
     # Step 1 — Global series assignment                                    #
@@ -289,52 +357,8 @@ class LookaheadPlanner(BasePlanner):
         return budgets
 
     # ------------------------------------------------------------------ #
-    # Step 3 — Patrol orders                                               #
+    # Repositioning & Helper                                               #
     # ------------------------------------------------------------------ #
-
-    def _build_patrol_orders(
-        self,
-        patrols:     List[AgentState],
-        assignments: Dict[int, List[int]],
-        budgets:     Dict[int, int],
-        state:       DayState,
-    ) -> List[DayOrder]:
-        uncollected = set(self.map.series_ids) - state.collected_series
-
-        def patrol_priority(p: AgentState) -> float:
-            wps = assignments.get(p.id, [])
-            if not wps:
-                return 0.0
-            first = self.map.spot_map.get(wps[0])
-            return 100.0 if (first and first.series_id in uncollected) else 1.0
-
-        sorted_patrols = sorted(patrols, key=patrol_priority, reverse=True)
-        orders: List[DayOrder] = []
-
-        for patrol in sorted_patrols:
-            waypoints = assignments.get(patrol.id, [])
-
-            if not waypoints:
-                orders.append(DayOrder(agent_id=patrol.id, actions=[]))
-                continue
-
-            actions = multi_waypoint_path(
-                self.grid,
-                self._terrain,
-                state.traffic,
-                patrol.cell,
-                waypoints,
-                step_budget=budgets[patrol.id],
-                fuel_budget=patrol.fuel if patrol.is_patrol() else None,
-            )
-
-            # End-of-day repositioning: if budget and fuel remain, drift toward
-            # the next uncollected series spot not yet in the route.
-            actions = self._append_reposition(patrol, waypoints, actions, budgets[patrol.id], state)
-
-            orders.append(DayOrder(agent_id=patrol.id, actions=actions))
-
-        return orders
 
     def _append_reposition(
         self,
@@ -351,18 +375,20 @@ class LookaheadPlanner(BasePlanner):
         if not actions:
             return actions
 
-        # Estimate steps used so far (rough: count move actions)
-        steps_used = sum(
-            self.sim._step_cost(patrol.cell, state.traffic)
-            for a in actions if a.cmd == "move"
-        )
+        # Calculate actual steps used so far and find the correct final cell
+        steps_used = 0
+        cur_cell = patrol.cell
+        for act in actions:
+            if act.cmd == "move":
+                steps_used += self.sim._step_cost(cur_cell, state.traffic)
+                dst = self.grid.neighbor_in_dir(cur_cell, act.direction)
+                if dst is not None:
+                    cur_cell = dst
+        end_cell = cur_cell
+
         remaining = budget - steps_used
         if remaining < 2:
             return actions
-
-        # Final cell after executing current route
-        # (rough: assume each step lands on an adjacent cell)
-        end_cell = waypoints[-1] if waypoints else patrol.cell
 
         # Find next best spot not already in route
         already = set(waypoints)
@@ -581,31 +607,4 @@ class LookaheadPlanner(BasePlanner):
 
         return cur if cur != patrol_cell else None
 
-    # ------------------------------------------------------------------ #
-    # Step 5 — Build supply orders from pre-computed targets               #
-    # ------------------------------------------------------------------ #
 
-    def _build_supply_orders_from_targets(
-        self,
-        supplies:       List[AgentState],
-        supply_targets: Dict[int, Optional[int]],
-        budgets:        Dict[int, int],
-        state:          DayState,
-    ) -> List[DayOrder]:
-        orders: List[DayOrder] = []
-        for supply in supplies:
-            target = supply_targets.get(supply.id)
-            if target is None:
-                orders.append(DayOrder(agent_id=supply.id, actions=[]))
-                continue
-            result = find_path(
-                self.grid, self._terrain, state.traffic,
-                supply.cell, target,
-                step_budget=budgets[supply.id],
-                fuel_budget=None,
-            )
-            orders.append(DayOrder(
-                agent_id=supply.id,
-                actions=result.actions if result.reachable else [],
-            ))
-        return orders

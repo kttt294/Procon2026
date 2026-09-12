@@ -116,8 +116,22 @@ class ActorCritic(nn.Module):
             nn.ReLU(),
         )
 
-        # Actor: outputs max_spots + 1 logits (slots 0..max_spots-1 = spots, max_spots = STAY)
-        self.actor_head  = nn.Linear(hidden // 2 + hidden, max_spots + 1)
+        # Attention networks for Actor Head (Pointer Network)
+        self.query_mlp = nn.Sequential(
+            nn.Linear(hidden // 2 + hidden, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+        )
+        self.key_mlp = nn.Sequential(
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+        )
+        self.stay_head = nn.Sequential(
+            nn.Linear(hidden, hidden // 2),
+            nn.ReLU(),
+            nn.Linear(hidden // 2, 1),
+        )
 
         # Critic: scalar value estimate
         self.critic_head = nn.Linear(hidden, 1)
@@ -252,20 +266,31 @@ class ActorCritic(nn.Module):
         global_in   = torch.cat([pooled.squeeze(0), collected_vec, day_info])
         global_feat = self.global_mlp(global_in.unsqueeze(0))   # (1, hidden)
 
-        # --- actor logits with invalid-slot masking ---
-        # Slots n_spots .. max_spots-1 are padding (not real spots) → mask to -inf
-        # Slot max_spots is always STAY → never masked
+        # --- actor logits with attention-based pointer and invalid-slot masking ---
+        # Query vector for each agent
         logits_list: List[torch.Tensor] = []
         for aid in agent_indices:
             idx      = next(i for i, a in enumerate(state.my_agents) if a.id == aid)
             af       = agent_feats[idx]                             # (1, hidden//2)
             combined = torch.cat([af, global_feat], dim=-1)        # (1, hidden//2+hidden)
-            logits   = self.actor_head(combined).clone()           # (1, max_spots+1)
+            query    = self.query_mlp(combined)                     # (1, hidden)
 
-            # Mask padding slots (keep real spots 0..n_spots-1 and STAY at max_spots)
-            if n_spots < self.max_spots:
-                logits[0, n_spots:self.max_spots] = float("-inf")
+            # Compute logits for all max_spots
+            logits   = torch.zeros(1, self.max_spots + 1, device=self.device)
+            
+            for i in range(self.max_spots):
+                if i < n_spots:
+                    cell_id = map_data.spots[i].cell_id
+                    r_spot, c_spot = divmod(cell_id, W)
+                    spot_embed = spatial[0, :, r_spot, c_spot]      # (hidden,)
+                    key = self.key_mlp(spot_embed.unsqueeze(0))     # (1, hidden)
+                    logits[0, i] = (query * key).sum(dim=-1)
+                else:
+                    # Mask padding slots
+                    logits[0, i] = float("-inf")
 
+            # STAY action (index max_spots)
+            logits[0, self.max_spots] = self.stay_head(query).squeeze(-1)
             logits_list.append(logits)
 
         # --- critic ---

@@ -149,7 +149,9 @@ class MAPPOTrainer:
             {"params": self.model.map_encoder.parameters(),  "lr": C.LR_ACTOR},
             {"params": self.model.agent_mlp.parameters(),    "lr": C.LR_ACTOR},
             {"params": self.model.global_mlp.parameters(),   "lr": C.LR_ACTOR},
-            {"params": self.model.actor_head.parameters(),   "lr": C.LR_ACTOR},
+            {"params": self.model.query_mlp.parameters(),    "lr": C.LR_ACTOR},
+            {"params": self.model.key_mlp.parameters(),      "lr": C.LR_ACTOR},
+            {"params": self.model.stay_head.parameters(),    "lr": C.LR_ACTOR},
             {"params": self.model.critic_head.parameters(),  "lr": C.LR_CRITIC},
         ])
 
@@ -450,11 +452,12 @@ class MAPPOTrainer:
         patrol_ids: List[int],
         actions:    List[int],
     ) -> List[DayOrder]:
-        """Convert spot-index actions -> DayOrders via A*."""
+        """Convert spot-index actions -> DayOrders via A* using sequential step allocation."""
         orders:      List[DayOrder] = []
         terrain      = {c.id: c.terrain for c in map_data.cells}
         agents_by_id = state.agents_by_id()
         n_spots      = len(map_data.spots)
+        remaining_shared_steps = state.steps_left
 
         for aid, act in zip(patrol_ids, actions):
             agent = agents_by_id[aid]
@@ -465,10 +468,21 @@ class MAPPOTrainer:
             path_actions = multi_waypoint_path(
                 sim.grid, terrain, state.traffic,
                 agent.cell, [target_cell],
-                step_budget = state.steps_left,
+                step_budget = remaining_shared_steps,
                 fuel_budget = agent.fuel if agent.is_patrol() else None,
             )
             orders.append(DayOrder(agent_id=aid, actions=path_actions))
+
+            # Calculate actual steps used by this agent's actions
+            actual_steps_used = 0
+            cur_cell = agent.cell
+            for a in path_actions:
+                if a.cmd == "move":
+                    actual_steps_used += sim._step_cost(cur_cell, state.traffic)
+                    dst = sim.grid.neighbor_in_dir(cur_cell, a.direction)
+                    if dst is not None:
+                        cur_cell = dst
+            remaining_shared_steps = max(0, remaining_shared_steps - actual_steps_used)
 
         greedy = GreedyPlanner(cfg, map_data, sim)
         for agent in state.supply_agents():
@@ -476,12 +490,23 @@ class MAPPOTrainer:
             if target is not None:
                 result = find_path(
                     sim.grid, terrain, state.traffic,
-                    agent.cell, target, step_budget=state.steps_left,
+                    agent.cell, target, step_budget=remaining_shared_steps,
                 )
                 supply_actions = result.actions if result.reachable else []
             else:
                 supply_actions = []
             orders.append(DayOrder(agent_id=agent.id, actions=supply_actions))
+
+            # Calculate actual steps used by this supply car
+            actual_steps_used = 0
+            cur_cell = agent.cell
+            for a in supply_actions:
+                if a.cmd == "move":
+                    actual_steps_used += sim._step_cost(cur_cell, state.traffic)
+                    dst = sim.grid.neighbor_in_dir(cur_cell, a.direction)
+                    if dst is not None:
+                        cur_cell = dst
+            remaining_shared_steps = max(0, remaining_shared_steps - actual_steps_used)
 
         return orders
 
